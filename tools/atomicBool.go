@@ -1,4 +1,4 @@
-package tootls
+package tools
 
 import "sync/atomic"
 

@@ -63,6 +63,7 @@ func (l *Lifecycle) listenForShutdown() {
 		close(doneChan)
 	}()
 
+	logger.Info("waiting for goroutines to finish")
 	select {
 	case <-doneChan:
 	case <-timeout:
