@@ -110,6 +110,13 @@ func Debug(msg string, fields ...zapcore.Field) {
 	log.Debug(msg, fields...)
 }
 
+func Debugf(template string, args ...interface{}) {
+	if log == nil {
+		panic(ErrNotInit)
+	}
+	log.Sugar().Debugf(template, args...)
+}
+
 func Infof(template string, args ...interface{}) {
 	if log == nil {
 		panic(ErrNotInit)
