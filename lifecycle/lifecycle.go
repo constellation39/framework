@@ -2,7 +2,7 @@ package lifecycle
 
 import (
 	"context"
-	"framework/logger"
+	"fmt"
 	"go.uber.org/zap"
 	"os"
 	"os/signal"
@@ -11,93 +11,159 @@ import (
 	"time"
 )
 
-var life *Lifecycle
-
-func init() {
-	life = New()
+// Options 配置选项
+type Options struct {
+	// 关闭超时时间
+	ShutdownTimeout time.Duration
+	// 错误处理函数
+	ErrorHandler func(error)
+	// 信号处理函数
+	SignalHandler func(os.Signal)
+	// 日志接口
+	Logger *zap.Logger
 }
 
+// DefaultOptions 返回默认配置
+func DefaultOptions() Options {
+	return Options{
+		ShutdownTimeout: 30 * time.Second,
+		ErrorHandler:    func(err error) {},
+		SignalHandler:   func(sig os.Signal) {},
+		Logger:          zap.NewNop(),
+	}
+}
+
+// Lifecycle 生命周期管理器
 type Lifecycle struct {
-	ctx    context.Context
-	cancel context.CancelFunc
-	wg     sync.WaitGroup
-	done   chan struct{}
+	ctx          context.Context
+	cancel       context.CancelFunc
+	wg           sync.WaitGroup
+	done         chan struct{}
+	opts         Options
+	cleanupHooks []func() error
+	errors       chan error
+	shutdownOnce sync.Once
 }
 
-func New() *Lifecycle {
+// New 创建新的生命周期管理器
+func New(opts Options) *Lifecycle {
 	ctx, cancel := context.WithCancel(context.Background())
+
 	lc := &Lifecycle{
-		ctx:    ctx,
-		cancel: cancel,
-		wg:     sync.WaitGroup{},
-		done:   make(chan struct{}),
+		ctx:          ctx,
+		cancel:       cancel,
+		wg:           sync.WaitGroup{},
+		done:         make(chan struct{}),
+		opts:         opts,
+		cleanupHooks: make([]func() error, 0),
+		errors:       make(chan error, 100),
 	}
 
 	go lc.listenForShutdown()
+	go lc.handleErrors()
 
 	return lc
 }
 
+// Context 返回context
 func (l *Lifecycle) Context() context.Context {
 	return l.ctx
 }
 
+// AddCleanupHook 添加清理钩子
+func (l *Lifecycle) AddCleanupHook(hook func() error) {
+	l.cleanupHooks = append(l.cleanupHooks, hook)
+}
+
+// handleErrors 处理错误channel中的错误
+func (l *Lifecycle) handleErrors() {
+	for err := range l.errors {
+		if l.opts.ErrorHandler != nil {
+			l.opts.ErrorHandler(err)
+		}
+		l.opts.Logger.Error("goroutine error", zap.Error(err))
+	}
+}
+
+// listenForShutdown 监听关闭信号
 func (l *Lifecycle) listenForShutdown() {
 	sigChan := make(chan os.Signal, 1)
-	defer signal.Stop(sigChan) // 确保在退出时停止信号通知
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+	defer signal.Stop(sigChan)
 
+	var sig os.Signal
 	select {
-	case _, ok := <-sigChan:
-		if !ok {
-			return
-		}
-		l.cancel()
+	case s := <-sigChan:
+		sig = s
+		l.opts.Logger.Info("received signal", zap.String("signal", sig.String()))
+	case <-l.ctx.Done():
+		l.opts.Logger.Info("context cancelled")
 	}
 
-	timeout := time.After(2 * time.Second)
-	doneChan := make(chan struct{})
-
-	go func() {
-		l.wg.Wait()
-		close(doneChan)
-	}()
-
-	logger.Info("waiting for goroutines to finish")
-	select {
-	case <-doneChan:
-	case <-timeout:
-		logger.Error("timeout waiting for goroutines to finish")
+	if sig != nil && l.opts.SignalHandler != nil {
+		l.opts.SignalHandler(sig)
 	}
 
-	close(l.done)
+	l.shutdown()
 }
 
-func (l *Lifecycle) Go(f func(ctx context.Context)) {
+// shutdown 执行关闭流程
+func (l *Lifecycle) shutdown() {
+	l.shutdownOnce.Do(func() {
+		l.cancel()
+
+		// 执行清理钩子
+		for _, hook := range l.cleanupHooks {
+			if err := hook(); err != nil {
+				l.opts.Logger.Error("cleanup hook error", zap.Error(err))
+			}
+		}
+
+		// 等待所有goroutine完成或超时
+		doneChan := make(chan struct{})
+		go func() {
+			l.wg.Wait()
+			close(doneChan)
+		}()
+
+		l.opts.Logger.Info("waiting for goroutines to finish")
+		select {
+		case <-doneChan:
+			l.opts.Logger.Info("all goroutines finished")
+		case <-time.After(l.opts.ShutdownTimeout):
+			l.opts.Logger.Error("timeout waiting for goroutines to finish")
+		}
+
+		close(l.errors)
+		close(l.done)
+	})
+}
+
+// Go 启动一个受管理的goroutine
+func (l *Lifecycle) Go(f func(ctx context.Context) error) {
 	l.wg.Add(1)
 	go func() {
+		defer l.wg.Done()
 		defer func() {
 			if r := recover(); r != nil {
-				logger.Error("panic in lifecycle.Go", zap.Reflect("r", r))
+				err := fmt.Errorf("panic recovered: %v", r)
+				l.errors <- err
 			}
 		}()
-		defer l.wg.Done()
-		f(l.ctx)
+
+		if err := f(l.ctx); err != nil {
+			l.errors <- err
+		}
 	}()
 }
 
+// Wait 等待生命周期结束
 func (l *Lifecycle) Wait() {
 	<-l.done
 }
 
-func Context() context.Context {
-	return life.Context()
-}
-
-func Go(f func(ctx context.Context)) {
-	life.Go(f)
-}
-
-func Wait() {
-	life.Wait()
+// Shutdown 主动触发关闭
+func (l *Lifecycle) Shutdown() {
+	l.cancel()
+	l.Wait()
 }

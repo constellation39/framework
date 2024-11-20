@@ -1,167 +1,235 @@
 package logger
 
 import (
+	"fmt"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
 	"gopkg.in/natefinch/lumberjack.v2"
+	"log"
 	"os"
+	"time"
 )
 
-type Config struct {
-	Level      zapcore.Level `json:"level"`      // 日志级别，有效值包括 "debug"、"info"、"warn"、"error" 和 "fatal"
-	Filename   string        `json:"filename"`   // 日志文件的位置
-	MaxSize    int           `json:"maxSize"`    // 单个日志文件的最大大小，单位为兆字节
-	MaxBackups int           `json:"maxBackups"` // 保留的旧日志文件的最大数量
-	MaxAge     int           `json:"maxAge"`     // 保留旧日志文件的最大天数
-	Compress   bool          `json:"compress"`   // 是否压缩旧的日志文件
-	Stdout     bool          `json:"stdout"`     // 是否将日志输出到标准输出（控制台）
+// Logger 定义日志接口
+type Logger interface {
+	Debug(msg string, fields ...zapcore.Field)
+	Info(msg string, fields ...zapcore.Field)
+	Warn(msg string, fields ...zapcore.Field)
+	Error(msg string, fields ...zapcore.Field)
+	DPanic(msg string, fields ...zapcore.Field)
+	Panic(msg string, fields ...zapcore.Field)
+	Fatal(msg string, fields ...zapcore.Field)
+
+	Debugf(template string, args ...interface{})
+	Infof(template string, args ...interface{})
+	Warnf(template string, args ...interface{})
+	Errorf(template string, args ...interface{})
+	DPanicf(template string, args ...interface{})
+	Panicf(template string, args ...interface{})
+	Fatalf(template string, args ...interface{})
+
+	// 标准库 log 接口
+	Print(v ...interface{})
+	Printf(format string, v ...interface{})
+	Println(v ...interface{})
+
+	Sync() error
+	With(fields ...zapcore.Field) Logger
 }
 
-var log *zap.Logger
+// Options 定义日志配置选项
+type Options struct {
+	// 基础配置
+	Level    zapcore.Level
+	Filename string
+	Stdout   bool
 
-const ErrNotInit = `logger not initialized, please call logger.Init(config) first.`
+	// 文件轮转配置
+	Rotation RotationOptions
 
-func Init(config Config) {
-	var fileWriters []zapcore.WriteSyncer
-	var consoleWriters []zapcore.WriteSyncer
+	// 编码配置
+	Encoding       string // json 或 console
+	EncodingConfig *zapcore.EncoderConfig
 
-	fileW := zapcore.AddSync(&lumberjack.Logger{
-		Filename:   config.Filename,
-		MaxSize:    config.MaxSize, // megabytes
-		MaxBackups: config.MaxBackups,
-		MaxAge:     config.MaxAge, // days
-		Compress:   config.Compress,
-	})
-	fileWriters = append(fileWriters, fileW)
+	// 扩展选项
+	Development bool
+	CallerSkip  int
+	Fields      []zap.Field // 初始字段
+}
 
-	encoderCfg := zap.NewProductionEncoderConfig()
-	encoderCfg.EncodeTime = zapcore.ISO8601TimeEncoder
-	encoderCfg.EncodeLevel = zapcore.CapitalLevelEncoder
-	encoderCfg.EncodeDuration = zapcore.StringDurationEncoder
-	encoderCfg.EncodeCaller = zapcore.ShortCallerEncoder
+// RotationOptions 定义日志轮转配置
+type RotationOptions struct {
+	MaxSize    int  // MB
+	MaxBackups int  // 文件个数
+	MaxAge     int  // 天数
+	Compress   bool // 是否压缩
+	LocalTime  bool // 使用本地时间
+}
 
+// DefaultOptions 返回默认配置
+func DefaultOptions() Options {
+	return Options{
+		Level:    zapcore.InfoLevel,
+		Stdout:   true,
+		Encoding: "json",
+		EncodingConfig: &zapcore.EncoderConfig{
+			TimeKey:        "time",
+			LevelKey:       "level",
+			NameKey:        "logger",
+			CallerKey:      "caller",
+			MessageKey:     "msg",
+			StacktraceKey:  "stacktrace",
+			LineEnding:     zapcore.DefaultLineEnding,
+			EncodeLevel:    zapcore.CapitalLevelEncoder,
+			EncodeTime:     zapcore.ISO8601TimeEncoder,
+			EncodeDuration: zapcore.StringDurationEncoder,
+			EncodeCaller:   zapcore.ShortCallerEncoder,
+		},
+		Rotation: RotationOptions{
+			MaxSize:    100,
+			MaxBackups: 3,
+			MaxAge:     28,
+			Compress:   true,
+			LocalTime:  true,
+		},
+		Development: false,
+		CallerSkip:  1,
+	}
+}
+
+// logger 实现 Logger 接口
+type logger struct {
+	zap     *zap.Logger
+	sugar   *zap.SugaredLogger
+	stdLog  *log.Logger
+	opts    Options
+	isDebug bool
+}
+
+// New 创建新的日志实例
+func New(options Options) (Logger, error) {
+	cores, err := buildCores(options)
+	if err != nil {
+		return nil, fmt.Errorf("build cores failed: %w", err)
+	}
+
+	zapOpts := []zap.Option{zap.AddCaller()}
+	if options.Development {
+		zapOpts = append(zapOpts, zap.Development())
+	}
+	if options.CallerSkip > 0 {
+		zapOpts = append(zapOpts, zap.AddCallerSkip(options.CallerSkip))
+	}
+	if len(options.Fields) > 0 {
+		zapOpts = append(zapOpts, zap.Fields(options.Fields...))
+	}
+
+	l := &logger{
+		zap:     zap.New(zapcore.NewTee(cores...), zapOpts...),
+		opts:    options,
+		isDebug: options.Level == zapcore.DebugLevel,
+	}
+	l.sugar = l.zap.Sugar()
+
+	// 创建标准库logger
+	writer := zapcore.AddSync(l)
+	l.stdLog = log.New(writer, "", 0)
+
+	return l, nil
+}
+
+func NewDefaultLogger() (Logger, error) {
+	opts := DefaultOptions()
+	return New(opts)
+}
+
+// buildCores 构建日志核心
+func buildCores(opts Options) ([]zapcore.Core, error) {
 	var cores []zapcore.Core
-	if config.Stdout {
-		consoleWriters = append(consoleWriters, zapcore.AddSync(os.Stdout))
 
-		consoleLevel := zapcore.InfoLevel
-		if config.Level >= consoleLevel {
-			consoleLevel = config.Level
-		}
-		consoleEncoder := zapcore.NewConsoleEncoder(encoderCfg)
-		consoleCore := zapcore.NewCore(consoleEncoder, zapcore.NewMultiWriteSyncer(consoleWriters...), consoleLevel)
-		cores = append(cores, consoleCore)
+	// 创建编码器
+	var encoder zapcore.Encoder
+	if opts.Encoding == "console" {
+		encoder = zapcore.NewConsoleEncoder(*opts.EncodingConfig)
+	} else {
+		encoder = zapcore.NewJSONEncoder(*opts.EncodingConfig)
 	}
 
-	fileEncoder := zapcore.NewJSONEncoder(encoderCfg)
-	fileCore := zapcore.NewCore(fileEncoder, zapcore.NewMultiWriteSyncer(fileWriters...), config.Level)
-	cores = append(cores, fileCore)
+	// 添加文件输出（记录所有级别）
+	if opts.Filename != "" {
+		fileWriter := zapcore.AddSync(&lumberjack.Logger{
+			Filename:   opts.Filename,
+			MaxSize:    opts.Rotation.MaxSize,
+			MaxBackups: opts.Rotation.MaxBackups,
+			MaxAge:     opts.Rotation.MaxAge,
+			Compress:   opts.Rotation.Compress,
+			LocalTime:  opts.Rotation.LocalTime,
+		})
+		cores = append(cores, zapcore.NewCore(encoder, fileWriter, zapcore.DebugLevel))
+	}
 
-	core := zapcore.NewTee(cores...)
-	log = zap.New(core, zap.AddCaller(), zap.Development(), zap.AddCallerSkip(1))
+	// 添加标准输出（按照配置级别）
+	if opts.Stdout {
+		stdoutWriter := zapcore.AddSync(os.Stdout)
+		cores = append(cores, zapcore.NewCore(encoder, stdoutWriter, opts.Level))
+	}
+
+	if len(cores) == 0 {
+		return nil, fmt.Errorf("no output configured")
+	}
+
+	return cores, nil
 }
 
-func Info(msg string, fields ...zapcore.Field) {
-	if log == nil {
-		panic(ErrNotInit)
-	}
-	log.Info(msg, fields...)
+// Write 实现 io.Writer 接口，用于标准库 log 的输出
+func (l *logger) Write(p []byte) (n int, err error) {
+	l.Info(string(p))
+	return len(p), nil
 }
 
-func Warn(msg string, fields ...zapcore.Field) {
-	if log == nil {
-		panic(ErrNotInit)
+// 实现 Logger 接口的方法
+func (l *logger) Debug(msg string, fields ...zapcore.Field) {
+	if l.isDebug {
+		// Debug模式下添加更多详细信息
+		fields = append(fields,
+			zap.Stack("stack"),
+			zap.Namespace("details"),
+			zap.Time("debug_time", time.Now()),
+		)
 	}
-	log.Warn(msg, fields...)
+	l.zap.Debug(msg, fields...)
 }
 
-func Error(msg string, fields ...zapcore.Field) {
-	if log == nil {
-		panic(ErrNotInit)
-	}
-	log.Error(msg, fields...)
-}
+func (l *logger) Info(msg string, fields ...zapcore.Field)   { l.zap.Info(msg, fields...) }
+func (l *logger) Warn(msg string, fields ...zapcore.Field)   { l.zap.Warn(msg, fields...) }
+func (l *logger) Error(msg string, fields ...zapcore.Field)  { l.zap.Error(msg, fields...) }
+func (l *logger) DPanic(msg string, fields ...zapcore.Field) { l.zap.DPanic(msg, fields...) }
+func (l *logger) Panic(msg string, fields ...zapcore.Field)  { l.zap.Panic(msg, fields...) }
+func (l *logger) Fatal(msg string, fields ...zapcore.Field)  { l.zap.Fatal(msg, fields...) }
 
-func DPanic(msg string, fields ...zapcore.Field) {
-	if log == nil {
-		panic(ErrNotInit)
-	}
-	log.DPanic(msg, fields...)
-}
+func (l *logger) Debugf(template string, args ...interface{})  { l.sugar.Debugf(template, args...) }
+func (l *logger) Infof(template string, args ...interface{})   { l.sugar.Infof(template, args...) }
+func (l *logger) Warnf(template string, args ...interface{})   { l.sugar.Warnf(template, args...) }
+func (l *logger) Errorf(template string, args ...interface{})  { l.sugar.Errorf(template, args...) }
+func (l *logger) DPanicf(template string, args ...interface{}) { l.sugar.DPanicf(template, args...) }
+func (l *logger) Panicf(template string, args ...interface{})  { l.sugar.Panicf(template, args...) }
+func (l *logger) Fatalf(template string, args ...interface{})  { l.sugar.Fatalf(template, args...) }
 
-func Panic(msg string, fields ...zapcore.Field) {
-	if log == nil {
-		panic(ErrNotInit)
-	}
-	log.Panic(msg, fields...)
-}
+// 实现标准库 log 接口
+func (l *logger) Print(v ...interface{})                 { l.stdLog.Print(v...) }
+func (l *logger) Printf(format string, v ...interface{}) { l.stdLog.Printf(format, v...) }
+func (l *logger) Println(v ...interface{})               { l.stdLog.Println(v...) }
 
-func Fatal(msg string, fields ...zapcore.Field) {
-	if log == nil {
-		panic(ErrNotInit)
-	}
-	log.Fatal(msg, fields...)
-}
+func (l *logger) Sync() error { return l.zap.Sync() }
 
-func Debug(msg string, fields ...zapcore.Field) {
-	if log == nil {
-		panic(ErrNotInit)
+func (l *logger) With(fields ...zapcore.Field) Logger {
+	newLogger := &logger{
+		zap:     l.zap.With(fields...),
+		opts:    l.opts,
+		isDebug: l.isDebug,
 	}
-	log.Debug(msg, fields...)
-}
-
-func Debugf(template string, args ...interface{}) {
-	if log == nil {
-		panic(ErrNotInit)
-	}
-	log.Sugar().Debugf(template, args...)
-}
-
-func Infof(template string, args ...interface{}) {
-	if log == nil {
-		panic(ErrNotInit)
-	}
-	log.Sugar().Infof(template, args...)
-}
-
-func Warnf(template string, args ...interface{}) {
-	if log == nil {
-		panic(ErrNotInit)
-	}
-	log.Sugar().Warnf(template, args...)
-}
-
-func Errorf(template string, args ...interface{}) {
-	if log == nil {
-		panic(ErrNotInit)
-	}
-	log.Sugar().Errorf(template, args...)
-}
-
-func DPanicf(template string, args ...interface{}) {
-	if log == nil {
-		panic(ErrNotInit)
-	}
-	log.Sugar().DPanicf(template, args...)
-}
-
-func Panicf(template string, args ...interface{}) {
-	if log == nil {
-		panic(ErrNotInit)
-	}
-	log.Sugar().Panicf(template, args...)
-}
-
-func Fatalf(template string, args ...interface{}) {
-	if log == nil {
-		panic(ErrNotInit)
-	}
-	log.Sugar().Fatalf(template, args...)
-}
-
-func Sync() error {
-	if log == nil {
-		panic(ErrNotInit)
-	}
-	return log.Sync()
+	newLogger.sugar = newLogger.zap.Sugar()
+	writer := zapcore.AddSync(newLogger)
+	newLogger.stdLog = log.New(writer, "", 0)
+	return newLogger
 }
