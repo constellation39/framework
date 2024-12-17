@@ -12,6 +12,7 @@ package buildinfo
 import (
 	"encoding/json"
 	"fmt"
+	"log"
 	"sync"
 	"time"
 )
@@ -38,17 +39,21 @@ type Info struct {
 var (
 	instance *Info
 	once     sync.Once
+	mu       sync.Mutex
 )
 
 // Get returns the build information singleton
-func Get() *Info {
+func Get() (*Info, error) {
 	once.Do(func() {
 		// Parse build time
 		t, err := time.Parse("2006-01-02 15:04:05", buildTime)
 		if err != nil {
+			log.Printf("Failed to parse build time: %v", err)
 			t = time.Time{} // Zero time if parsing fails
 		}
 
+		mu.Lock()
+		defer mu.Unlock()
 		instance = &Info{
 			Version:   version,
 			BuildTime: t,
@@ -58,15 +63,24 @@ func Get() *Info {
 		}
 
 		// Create human-readable build string
-		instance.BuildString = fmt.Sprintf("Version: %s, Built: %s, By: %s, Branch: %s, Commit: %.8s",
-			instance.Version,
-			instance.BuildTime.Format(time.RFC3339),
-			instance.GitUser,
-			instance.GitBranch,
-			instance.GitCommit,
-		)
+		instance.BuildString = generateBuildString(instance)
 	})
-	return instance
+
+	if instance == nil {
+		return nil, fmt.Errorf("build info instance is nil")
+	}
+	return instance, nil
+}
+
+// generateBuildString creates a human-readable build string
+func generateBuildString(i *Info) string {
+	return fmt.Sprintf("Version: %s, Built: %s, By: %s, Branch: %s, Commit: %.8s",
+		i.Version,
+		i.BuildTime.Format(time.RFC3339),
+		i.GitUser,
+		i.GitBranch,
+		i.GitCommit,
+	)
 }
 
 // String returns a human-readable representation of build information
