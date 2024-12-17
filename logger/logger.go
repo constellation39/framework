@@ -1,3 +1,4 @@
+// Package logger 提供一个灵活的日志记录器，支持多种输出形式和配置选项。
 package logger
 
 import (
@@ -87,7 +88,7 @@ type logger struct {
 	isDebug bool
 }
 
-// New 创建新的日志实例
+// New 创建新的日志实例并返回 Logger 接口。
 func New(options Options) (Logger, error) {
 	encodingConfig := &zapcore.EncoderConfig{
 		TimeKey:        "time",
@@ -133,17 +134,18 @@ func New(options Options) (Logger, error) {
 	return l, nil
 }
 
+// NewDefaultLogger 创建一个使用默认配置的日志实例并返回 Logger 接口。
 func NewDefaultLogger() (Logger, error) {
 	opts := DefaultOptions()
 	return New(opts)
 }
 
-// createCore 创建日志核心
+// createCore 创建日志核心，定义日志的编码器和写入器。
 func createCore(encoder zapcore.Encoder, writer zapcore.WriteSyncer, level zapcore.Level) zapcore.Core {
 	return zapcore.NewCore(encoder, writer, level)
 }
 
-// buildCores 构建日志核心
+// buildCores 构建日志核心，依据配置生成一个或多个日志输出核心。
 func buildCores(opts Options, encodingConfig *zapcore.EncoderConfig) ([]zapcore.Core, error) {
 	var cores []zapcore.Core
 
@@ -177,13 +179,13 @@ func buildCores(opts Options, encodingConfig *zapcore.EncoderConfig) ([]zapcore.
 	return cores, nil
 }
 
-// Write 实现 io.Writer 接口，用于标准库 log 的输出
+// Write 实现 io.Writer 接口，用于标准库 log 的输出。
 func (l *logger) Write(p []byte) (n int, err error) {
 	l.Info(string(p))
 	return len(p), nil
 }
 
-// processDebugFields 处理 Debug 模式下的字段
+// processDebugFields 处理 Debug 模式下的字段，添加额外的调试信息。
 func (l *logger) processDebugFields(fields []zapcore.Field) []zapcore.Field {
 	return append(fields,
 		zap.Stack("stack"),
@@ -192,7 +194,7 @@ func (l *logger) processDebugFields(fields []zapcore.Field) []zapcore.Field {
 	)
 }
 
-// 实现 Logger 接口的方法
+// Debug 记录调试级别的日志消息。
 func (l *logger) Debug(msg string, fields ...zapcore.Field) {
 	if l.isDebug {
 		fields = l.processDebugFields(fields)
@@ -200,28 +202,58 @@ func (l *logger) Debug(msg string, fields ...zapcore.Field) {
 	l.zap.Debug(msg, fields...)
 }
 
+// Info 记录信息级别的日志消息。
 func (l *logger) Info(msg string, fields ...zapcore.Field)   { l.zap.Info(msg, fields...) }
+
+// Warn 记录警告级别的日志消息。
 func (l *logger) Warn(msg string, fields ...zapcore.Field)   { l.zap.Warn(msg, fields...) }
+
+// Error 记录错误级别的日志消息。
 func (l *logger) Error(msg string, fields ...zapcore.Field)  { l.zap.Error(msg, fields...) }
+
+// DPanic 记录严重错误级别的日志消息，并在开发模式下引发 panic。
 func (l *logger) DPanic(msg string, fields ...zapcore.Field) { l.zap.DPanic(msg, fields...) }
+
+// Panic 记录 panic 级别的日志消息。
 func (l *logger) Panic(msg string, fields ...zapcore.Field)  { l.zap.Panic(msg, fields...) }
+
+// Fatal 记录致命级别的日志消息，并终止程序。
 func (l *logger) Fatal(msg string, fields ...zapcore.Field)  { l.zap.Fatal(msg, fields...) }
 
+// Debugf 使用格式化字符串记录调试级别的日志消息。
 func (l *logger) Debugf(template string, args ...interface{})  { l.sugar.Debugf(template, args...) }
+
+// Infof 使用格式化字符串记录信息级别的日志消息。
 func (l *logger) Infof(template string, args ...interface{})   { l.sugar.Infof(template, args...) }
+
+// Warnf 使用格式化字符串记录警告级别的日志消息。
 func (l *logger) Warnf(template string, args ...interface{})   { l.sugar.Warnf(template, args...) }
+
+// Errorf 使用格式化字符串记录错误级别的日志消息。
 func (l *logger) Errorf(template string, args ...interface{})  { l.sugar.Errorf(template, args...) }
+
+// DPanicf 使用格式化字符串记录严重错误级别的日志消息，并在开发模式下引发 panic。
 func (l *logger) DPanicf(template string, args ...interface{}) { l.sugar.DPanicf(template, args...) }
+
+// Panicf 使用格式化字符串记录 panic 级别的日志消息。
 func (l *logger) Panicf(template string, args ...interface{})  { l.sugar.Panicf(template, args...) }
+
+// Fatalf 使用格式化字符串记录致命级别的日志消息，并终止程序。
 func (l *logger) Fatalf(template string, args ...interface{})  { l.sugar.Fatalf(template, args...) }
 
-// 实现标准库 log 接口
+// Print 实现标准库 log 接口，输出日志消息。
 func (l *logger) Print(v ...interface{})                 { l.stdLog.Print(v...) }
+
+// Printf 实现标准库 log 接口，使用格式化字符串输出日志消息。
 func (l *logger) Printf(format string, v ...interface{}) { l.stdLog.Printf(format, v...) }
+
+// Println 实现标准库 log 接口，输出日志消息，并追加换行符。
 func (l *logger) Println(v ...interface{})               { l.stdLog.Println(v...) }
 
+// Sync 同步日志缓冲区，确保所有日志都被写入。
 func (l *logger) Sync() error { return l.zap.Sync() }
 
+// With 返回一个新的 Logger 实例，添加指定的字段。
 func (l *logger) With(fields ...zapcore.Field) Logger {
 	newLogger := &logger{
 		zap:     l.zap.With(fields...),
