@@ -39,7 +39,6 @@ type Info struct {
 var (
 	instance *Info
 	once     sync.Once
-	mu       sync.Mutex
 )
 
 // Get returns the build information singleton
@@ -52,8 +51,6 @@ func Get() (*Info, error) {
 			t = time.Time{} // Zero time if parsing fails
 		}
 
-		mu.Lock()
-		defer mu.Unlock()
 		instance = &Info{
 			Version:   version,
 			BuildTime: t,
