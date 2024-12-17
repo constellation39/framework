@@ -22,7 +22,7 @@ type Lifecycle struct {
 	wg           sync.WaitGroup
 	done         chan struct{}
 	opts         Options
-	cleanupHooks []func() error
+	cleanupHooks []func()
 	shutdownOnce sync.Once
 }
 
@@ -36,7 +36,7 @@ func New(opts Options) *Lifecycle {
 		wg:           sync.WaitGroup{},
 		done:         make(chan struct{}),
 		opts:         opts,
-		cleanupHooks: make([]func() error, 0),
+		cleanupHooks: make([]func(), 0),
 	}
 
 	go lc.listenForSignalsAndShutdown()
@@ -50,7 +50,7 @@ func (l *Lifecycle) Context() context.Context {
 }
 
 // AddCleanupHook 添加清理钩子
-func (l *Lifecycle) AddCleanupHook(hook func() error) {
+func (l *Lifecycle) AddCleanupHook(hook func()) {
 	l.cleanupHooks = append(l.cleanupHooks, hook)
 }
 
@@ -72,18 +72,16 @@ func (l *Lifecycle) listenForSignalsAndShutdown() {
 func (l *Lifecycle) shutdown() {
 	l.shutdownOnce.Do(func() {
 		l.cancel()
-		l.executeCleanupHooks()
 		l.waitForGoroutines()
+		l.executeCleanupHooks()
 		close(l.done)
 	})
 }
 
-// executeCleanupHooks 执行清理钩子
+// executeCleanupHooks 执行清理钩子并返回错误
 func (l *Lifecycle) executeCleanupHooks() {
 	for _, hook := range l.cleanupHooks {
-		if err := hook(); err != nil {
-			// 移除错误处理逻辑
-		}
+		hook()
 	}
 }
 
@@ -103,21 +101,25 @@ func (l *Lifecycle) waitForGoroutines() {
 	}
 }
 
-// Go 启动一个受管理的goroutine
-func (l *Lifecycle) Go(f func(ctx context.Context) error) {
+// Go 启动一个受管理的goroutine并返回可能的错误
+func (l *Lifecycle) Go(f func(ctx context.Context) error) <-chan error {
+	errChan := make(chan error, 1)
 	l.wg.Add(1)
 	go func() {
 		defer l.wg.Done()
 		defer func() {
 			if r := recover(); r != nil {
-				// 移除错误处理逻辑
+				// 在这里记录 panic 错误
+				errChan <- fmt.Errorf("panic occurred: %v", r)
 			}
 		}()
 
 		if err := f(l.ctx); err != nil {
-			// 移除错误处理逻辑
+			errChan <- err // 将错误传递给外部
 		}
+		close(errChan)
 	}()
+	return errChan
 }
 
 // Wait 等待生命周期结束
