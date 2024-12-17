@@ -48,14 +48,9 @@ type Options struct {
 	// 文件轮转配置
 	Rotation RotationOptions
 
-	// 编码配置
-	Encoding       string // json 或 console
-	EncodingConfig *zapcore.EncoderConfig
-
 	// 扩展选项
-	Development bool
-	CallerSkip  int
-	Fields      []zap.Field // 初始字段
+	CallerSkip int
+	Fields     []zap.Field // 初始字段
 }
 
 // RotationOptions 定义日志轮转配置
@@ -72,19 +67,6 @@ func DefaultOptions() Options {
 	return Options{
 		Level:  zapcore.InfoLevel,
 		Stdout: true,
-		EncodingConfig: &zapcore.EncoderConfig{
-			TimeKey:        "time",
-			LevelKey:       "level",
-			NameKey:        "logger",
-			CallerKey:      "caller",
-			MessageKey:     "msg",
-			StacktraceKey:  "stacktrace",
-			LineEnding:     zapcore.DefaultLineEnding,
-			EncodeLevel:    zapcore.CapitalLevelEncoder,
-			EncodeTime:     zapcore.ISO8601TimeEncoder,
-			EncodeDuration: zapcore.StringDurationEncoder,
-			EncodeCaller:   zapcore.ShortCallerEncoder,
-		},
 		Rotation: RotationOptions{
 			MaxSize:    100,
 			MaxBackups: 3,
@@ -92,8 +74,7 @@ func DefaultOptions() Options {
 			Compress:   true,
 			LocalTime:  true,
 		},
-		Development: false,
-		CallerSkip:  1,
+		CallerSkip: 1,
 	}
 }
 
@@ -108,29 +89,27 @@ type logger struct {
 
 // New 创建新的日志实例
 func New(options Options) (Logger, error) {
-	if options.EncodingConfig == nil {
-		options.EncodingConfig = &zapcore.EncoderConfig{
-			TimeKey:        "time",
-			LevelKey:       "level",
-			NameKey:        "logger",
-			CallerKey:      "caller",
-			MessageKey:     "msg",
-			StacktraceKey:  "stacktrace",
-			LineEnding:     zapcore.DefaultLineEnding,
-			EncodeLevel:    zapcore.CapitalLevelEncoder,
-			EncodeTime:     zapcore.ISO8601TimeEncoder,
-			EncodeDuration: zapcore.StringDurationEncoder,
-			EncodeCaller:   zapcore.ShortCallerEncoder,
-		}
+	encodingConfig := &zapcore.EncoderConfig{
+		TimeKey:        "time",
+		LevelKey:       "level",
+		NameKey:        "logger",
+		CallerKey:      "caller",
+		MessageKey:     "msg",
+		StacktraceKey:  "stacktrace",
+		LineEnding:     zapcore.DefaultLineEnding,
+		EncodeLevel:    zapcore.CapitalLevelEncoder,
+		EncodeTime:     zapcore.ISO8601TimeEncoder,
+		EncodeDuration: zapcore.StringDurationEncoder,
+		EncodeCaller:   zapcore.ShortCallerEncoder,
 	}
 
-	cores, err := buildCores(options)
+	cores, err := buildCores(options, encodingConfig)
 	if err != nil {
 		return nil, fmt.Errorf("failed to build cores with options %+v: %w", options, err)
 	}
 
 	zapOpts := []zap.Option{zap.AddCaller()}
-	if options.Development {
+	if options.Level == zapcore.DebugLevel {
 		zapOpts = append(zapOpts, zap.Development())
 	}
 	if options.CallerSkip > 0 {
@@ -165,12 +144,14 @@ func createCore(encoder zapcore.Encoder, writer zapcore.WriteSyncer, level zapco
 }
 
 // buildCores 构建日志核心
-func buildCores(opts Options) ([]zapcore.Core, error) {
+func buildCores(opts Options, encodingConfig *zapcore.EncoderConfig) ([]zapcore.Core, error) {
 	var cores []zapcore.Core
 
-	jsonEncoder := zapcore.NewJSONEncoder(*opts.EncodingConfig)
-	consoleEncoder := zapcore.NewConsoleEncoder(*opts.EncodingConfig)
+	// 使用 JSON 编码器输出到文件
+	jsonEncoder := zapcore.NewJSONEncoder(*encodingConfig)
+	consoleEncoder := zapcore.NewConsoleEncoder(*encodingConfig)
 
+	// 如果设置了 Filename，输出到文件
 	if opts.Filename != "" {
 		fileWriter := zapcore.AddSync(&lumberjack.Logger{
 			Filename:   opts.Filename,
@@ -183,6 +164,7 @@ func buildCores(opts Options) ([]zapcore.Core, error) {
 		cores = append(cores, createCore(jsonEncoder, fileWriter, zapcore.DebugLevel))
 	}
 
+	// 如果需要输出到控制台，使用 console 编码器
 	if opts.Stdout {
 		stdoutWriter := zapcore.AddSync(os.Stdout)
 		cores = append(cores, createCore(consoleEncoder, stdoutWriter, opts.Level))
