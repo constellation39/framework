@@ -2,12 +2,13 @@ package logger
 
 import (
 	"fmt"
-	"go.uber.org/zap"
-	"go.uber.org/zap/zapcore"
-	"gopkg.in/natefinch/lumberjack.v2"
 	"log"
 	"os"
 	"time"
+
+	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
+	"gopkg.in/natefinch/lumberjack.v2"
 )
 
 // Logger 定义日志接口
@@ -109,7 +110,7 @@ type logger struct {
 func New(options Options) (Logger, error) {
 	cores, err := buildCores(options)
 	if err != nil {
-		return nil, fmt.Errorf("build cores failed: %w", err)
+		return nil, fmt.Errorf("failed to build cores with options %+v: %w", options, err)
 	}
 
 	zapOpts := []zap.Option{zap.AddCaller()}
@@ -142,6 +143,11 @@ func NewDefaultLogger() (Logger, error) {
 	return New(opts)
 }
 
+// createCore 创建日志核心
+func createCore(encoder zapcore.Encoder, writer zapcore.WriteSyncer, level zapcore.Level) zapcore.Core {
+	return zapcore.NewCore(encoder, writer, level)
+}
+
 // buildCores 构建日志核心
 func buildCores(opts Options) ([]zapcore.Core, error) {
 	var cores []zapcore.Core
@@ -158,12 +164,12 @@ func buildCores(opts Options) ([]zapcore.Core, error) {
 			Compress:   opts.Rotation.Compress,
 			LocalTime:  opts.Rotation.LocalTime,
 		})
-		cores = append(cores, zapcore.NewCore(jsonEncoder, fileWriter, zapcore.DebugLevel))
+		cores = append(cores, createCore(jsonEncoder, fileWriter, zapcore.DebugLevel))
 	}
 
 	if opts.Stdout {
 		stdoutWriter := zapcore.AddSync(os.Stdout)
-		cores = append(cores, zapcore.NewCore(consoleEncoder, stdoutWriter, opts.Level))
+		cores = append(cores, createCore(consoleEncoder, stdoutWriter, opts.Level))
 	}
 
 	if len(cores) == 0 {
@@ -179,15 +185,19 @@ func (l *logger) Write(p []byte) (n int, err error) {
 	return len(p), nil
 }
 
+// processDebugFields 处理 Debug 模式下的字段
+func (l *logger) processDebugFields(fields []zapcore.Field) []zapcore.Field {
+	return append(fields,
+		zap.Stack("stack"),
+		zap.Namespace("details"),
+		zap.Time("debug_time", time.Now()),
+	)
+}
+
 // 实现 Logger 接口的方法
 func (l *logger) Debug(msg string, fields ...zapcore.Field) {
 	if l.isDebug {
-		// Debug模式下添加更多详细信息
-		fields = append(fields,
-			zap.Stack("stack"),
-			zap.Namespace("details"),
-			zap.Time("debug_time", time.Now()),
-		)
+		fields = l.processDebugFields(fields)
 	}
 	l.zap.Debug(msg, fields...)
 }
