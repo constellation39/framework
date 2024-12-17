@@ -69,9 +69,8 @@ type RotationOptions struct {
 // DefaultOptions 返回默认配置
 func DefaultOptions() Options {
 	return Options{
-		Level:    zapcore.InfoLevel,
-		Stdout:   true,
-		Encoding: "json",
+		Level:  zapcore.InfoLevel,
+		Stdout: true,
 		EncodingConfig: &zapcore.EncoderConfig{
 			TimeKey:        "time",
 			LevelKey:       "level",
@@ -147,15 +146,9 @@ func NewDefaultLogger() (Logger, error) {
 func buildCores(opts Options) ([]zapcore.Core, error) {
 	var cores []zapcore.Core
 
-	// 创建编码器
-	var encoder zapcore.Encoder
-	if opts.Encoding == "console" {
-		encoder = zapcore.NewConsoleEncoder(*opts.EncodingConfig)
-	} else {
-		encoder = zapcore.NewJSONEncoder(*opts.EncodingConfig)
-	}
+	jsonEncoder := zapcore.NewJSONEncoder(*opts.EncodingConfig)
+	consoleEncoder := zapcore.NewConsoleEncoder(*opts.EncodingConfig)
 
-	// 添加文件输出（记录所有级别）
 	if opts.Filename != "" {
 		fileWriter := zapcore.AddSync(&lumberjack.Logger{
 			Filename:   opts.Filename,
@@ -165,13 +158,12 @@ func buildCores(opts Options) ([]zapcore.Core, error) {
 			Compress:   opts.Rotation.Compress,
 			LocalTime:  opts.Rotation.LocalTime,
 		})
-		cores = append(cores, zapcore.NewCore(encoder, fileWriter, zapcore.DebugLevel))
+		cores = append(cores, zapcore.NewCore(jsonEncoder, fileWriter, zapcore.DebugLevel))
 	}
 
-	// 添加标准输出（按照配置级别）
 	if opts.Stdout {
 		stdoutWriter := zapcore.AddSync(os.Stdout)
-		cores = append(cores, zapcore.NewCore(encoder, stdoutWriter, opts.Level))
+		cores = append(cores, zapcore.NewCore(consoleEncoder, stdoutWriter, opts.Level))
 	}
 
 	if len(cores) == 0 {

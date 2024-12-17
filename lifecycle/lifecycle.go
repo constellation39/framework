@@ -3,6 +3,7 @@ package lifecycle
 import (
 	"context"
 	"fmt"
+	"framework/logger"
 	"go.uber.org/zap"
 	"os"
 	"os/signal"
@@ -20,17 +21,7 @@ type Options struct {
 	// 信号处理函数
 	SignalHandler func(os.Signal)
 	// 日志接口
-	Logger *zap.Logger
-}
-
-// DefaultOptions 返回默认配置
-func DefaultOptions() Options {
-	return Options{
-		ShutdownTimeout: 30 * time.Second,
-		ErrorHandler:    func(err error) {},
-		SignalHandler:   func(sig os.Signal) {},
-		Logger:          zap.NewNop(),
-	}
+	Logger logger.Logger
 }
 
 // Lifecycle 生命周期管理器
@@ -95,9 +86,9 @@ func (l *Lifecycle) listenForShutdown() {
 	select {
 	case s := <-sigChan:
 		sig = s
-		l.opts.Logger.Info("received signal", zap.String("signal", sig.String()))
+		l.opts.Logger.Debug("received signal", zap.String("signal", sig.String()))
 	case <-l.ctx.Done():
-		l.opts.Logger.Info("context cancelled")
+		l.opts.Logger.Debug("context cancelled")
 	}
 
 	if sig != nil && l.opts.SignalHandler != nil {
@@ -126,10 +117,10 @@ func (l *Lifecycle) shutdown() {
 			close(doneChan)
 		}()
 
-		l.opts.Logger.Info("waiting for goroutines to finish")
+		l.opts.Logger.Debug("waiting for goroutines to finish")
 		select {
 		case <-doneChan:
-			l.opts.Logger.Info("all goroutines finished")
+			l.opts.Logger.Debug("all goroutines finished")
 		case <-time.After(l.opts.ShutdownTimeout):
 			l.opts.Logger.Error("timeout waiting for goroutines to finish")
 		}
