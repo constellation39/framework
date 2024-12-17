@@ -69,33 +69,44 @@ func (l *Lifecycle) AddCleanupHook(hook func() error) {
 // handleErrors 处理错误channel中的错误
 func (l *Lifecycle) handleErrors() {
 	for err := range l.errors {
-		if l.opts.ErrorHandler != nil {
-			l.opts.ErrorHandler(err)
-		}
-		l.opts.Logger.Error("goroutine error", zap.Error(err))
+		l.logError(err)
 	}
+}
+
+// logError 记录错误
+func (l *Lifecycle) logError(err error) {
+	if l.opts.ErrorHandler != nil {
+		l.opts.ErrorHandler(err)
+	}
+	l.opts.Logger.Error("goroutine error", zap.Error(err))
 }
 
 // listenForShutdown 监听关闭信号
 func (l *Lifecycle) listenForShutdown() {
+	sig := l.waitForSignal()
+	if sig != nil {
+		l.opts.Logger.Debug("received signal", zap.String("signal", sig.String()))
+		if l.opts.SignalHandler != nil {
+			l.opts.SignalHandler(sig)
+		}
+	} else {
+		l.opts.Logger.Debug("context cancelled")
+	}
+	l.shutdown()
+}
+
+// waitForSignal 等待关闭信号
+func (l *Lifecycle) waitForSignal() os.Signal {
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 	defer signal.Stop(sigChan)
 
-	var sig os.Signal
 	select {
 	case s := <-sigChan:
-		sig = s
-		l.opts.Logger.Debug("received signal", zap.String("signal", sig.String()))
+		return s
 	case <-l.ctx.Done():
-		l.opts.Logger.Debug("context cancelled")
+		return nil
 	}
-
-	if sig != nil && l.opts.SignalHandler != nil {
-		l.opts.SignalHandler(sig)
-	}
-
-	l.shutdown()
 }
 
 // shutdown 执行关闭流程
@@ -104,30 +115,40 @@ func (l *Lifecycle) shutdown() {
 		l.cancel()
 
 		// 执行清理钩子
-		for _, hook := range l.cleanupHooks {
-			if err := hook(); err != nil {
-				l.opts.Logger.Error("cleanup hook error", zap.Error(err))
-			}
-		}
+		l.executeCleanupHooks()
 
 		// 等待所有goroutine完成或超时
-		doneChan := make(chan struct{})
-		go func() {
-			l.wg.Wait()
-			close(doneChan)
-		}()
-
-		l.opts.Logger.Debug("waiting for goroutines to finish")
-		select {
-		case <-doneChan:
-			l.opts.Logger.Debug("all goroutines finished")
-		case <-time.After(l.opts.ShutdownTimeout):
-			l.opts.Logger.Error("timeout waiting for goroutines to finish")
-		}
+		l.waitForGoroutines()
 
 		close(l.errors)
 		close(l.done)
 	})
+}
+
+// executeCleanupHooks 执行清理钩子
+func (l *Lifecycle) executeCleanupHooks() {
+	for _, hook := range l.cleanupHooks {
+		if err := hook(); err != nil {
+			l.logError(err)
+		}
+	}
+}
+
+// waitForGoroutines 等待所有goroutine完成或超时
+func (l *Lifecycle) waitForGoroutines() {
+	doneChan := make(chan struct{})
+	go func() {
+		l.wg.Wait()
+		close(doneChan)
+	}()
+
+	l.opts.Logger.Debug("waiting for goroutines to finish")
+	select {
+	case <-doneChan:
+		l.opts.Logger.Debug("all goroutines finished")
+	case <-time.After(l.opts.ShutdownTimeout):
+		l.opts.Logger.Error("timeout waiting for goroutines to finish")
+	}
 }
 
 // Go 启动一个受管理的goroutine
