@@ -108,6 +108,22 @@ type logger struct {
 
 // New 创建新的日志实例
 func New(options Options) (Logger, error) {
+	if options.EncodingConfig == nil {
+		options.EncodingConfig = &zapcore.EncoderConfig{
+			TimeKey:        "time",
+			LevelKey:       "level",
+			NameKey:        "logger",
+			CallerKey:      "caller",
+			MessageKey:     "msg",
+			StacktraceKey:  "stacktrace",
+			LineEnding:     zapcore.DefaultLineEnding,
+			EncodeLevel:    zapcore.CapitalLevelEncoder,
+			EncodeTime:     zapcore.ISO8601TimeEncoder,
+			EncodeDuration: zapcore.StringDurationEncoder,
+			EncodeCaller:   zapcore.ShortCallerEncoder,
+		}
+	}
+
 	cores, err := buildCores(options)
 	if err != nil {
 		return nil, fmt.Errorf("failed to build cores with options %+v: %w", options, err)
