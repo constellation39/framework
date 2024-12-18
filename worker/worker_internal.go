@@ -140,11 +140,4 @@ func validateOptions(opts Options) error {
 		return errors.New("QueueSize must be greater than 0")
 	}
 	return nil
-	if opts.MaxWorkers < opts.MinWorkers {
-		return errors.New("MaxWorkers must be greater than or equal to MinWorkers")
-	}
-	if opts.QueueSize <= 0 {
-		return errors.New("QueueSize must be greater than 0")
-	}
-	return nil
 }

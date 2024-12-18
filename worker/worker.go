@@ -29,19 +29,16 @@ type worker[T any] struct {
 }
 
 // NewWorker 创建一个新的工作池。
-func NewWorker[T any](opts Options) (Worker[T], error) {
+func NewWorker[T any](ctx context.Context, opts Options) (Worker[T], error) {
 	if err := validateOptions(opts); err != nil {
 		return nil, err
 	}
-
-	ctx, cancel := context.WithCancel(context.Background())
 	w := &worker[T]{
 		opts:    opts,
 		quit:    make(chan struct{}),
-		ctx:     ctx,
-		cancel:  cancel,
 		metrics: NewMetrics(),
 	}
+	w.ctx, w.cancel = context.WithCancel(ctx)
 	return w, nil
 }
 
@@ -67,10 +64,6 @@ func (w *worker[T]) Submit(ctx context.Context, task func() T, ch chan<- Result[
 		w.metrics.QueueLength.Add(1)
 		w.metrics.ActiveTasks.Add(1)
 		return nil
-		//default:
-		//	ch <- Result[T]{Err: ErrPoolFull}
-		//	w.metrics.RejectedTasks.Add(1)
-		//	return ErrPoolFull
 	}
 }
 
