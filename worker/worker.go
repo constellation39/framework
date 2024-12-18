@@ -25,7 +25,7 @@ type worker[T any] struct {
 	// running 表示工作池是否正在运行的状态。
 	running atomic.Bool
 	// metrics 存储工作池的性能指标。
-	metrics Metrics
+	metrics *Metrics
 }
 
 // NewWorker 创建一个新的工作池。
@@ -53,6 +53,9 @@ func (w *worker[T]) Submit(ctx context.Context, task func() T, ch chan<- Result[
 		resultCh: ch,
 	}
 
+	if w.tasks == nil {
+		return errors.New("worker tasks channel not initialized, call Start() first")
+	}
 	select {
 	case <-ctx.Done():
 		ch <- Result[T]{Err: ctx.Err()}
@@ -61,8 +64,8 @@ func (w *worker[T]) Submit(ctx context.Context, task func() T, ch chan<- Result[
 		ch <- Result[T]{Err: ErrWorkerStopped}
 		return ErrWorkerStopped
 	case w.tasks <- wrappedTask:
-		w.metrics.QueueLength.Add(1)
-		w.metrics.ActiveTasks.Add(1)
+		w.metrics.IncrementQueueLength(1)
+		w.metrics.IncrementActiveTasks(1)
 		return nil
 	}
 }
@@ -75,16 +78,9 @@ func (w *worker[T]) Start() error {
 
 	w.tasks = make(chan Task[T], w.opts.QueueSize)
 
-	// 启动最小数量的工作协程
-	for i := 0; i < w.opts.MinWorkers; i++ {
+	for i := 0; i < w.opts.WorkerSize; i++ {
 		w.startWorker()
 	}
-
-	// 启动自动扩缩容协程
-	if w.opts.MaxWorkers > w.opts.MinWorkers {
-		go w.autoScale()
-	}
-
 	return nil
 }
 
@@ -107,7 +103,7 @@ func (w *worker[T]) Stop() error {
 	select {
 	case <-done:
 	case <-timeout:
-		w.metrics.ErrorCount.Add(int64(w.metrics.ActiveTasks.Load()))
+		w.metrics.IncrementErrorCount(int64(w.metrics.GetActiveTasks()))
 	}
 
 	close(w.quit)
@@ -116,7 +112,7 @@ func (w *worker[T]) Stop() error {
 	return nil
 }
 
-func (w *worker[T]) Metrics() Metrics {
+func (w *worker[T]) Metrics() *Metrics {
 	return w.metrics
 }
 
@@ -125,11 +121,11 @@ func (w *worker[T]) Scale(delta int) error {
 		return ErrWorkerStopped
 	}
 
-	currentWorkers := w.metrics.ActiveWorkers.Load()
+	currentWorkers := w.metrics.GetActiveWorkers()
 	newCount := int(currentWorkers) + delta
 
-	if newCount < w.opts.MinWorkers || newCount > w.opts.MaxWorkers {
-		return errors.New("worker count out of valid range")
+	if newCount < 0 {
+		return errors.New("cannot scale down below 0 workers")
 	}
 
 	if delta > 0 {
@@ -140,7 +136,7 @@ func (w *worker[T]) Scale(delta int) error {
 		for i := 0; i < -delta; i++ {
 			select {
 			case w.quit <- struct{}{}:
-			default:
+			case <-time.After(10 * time.Millisecond):
 				return errors.New("failed to scale down workers")
 			}
 		}
