@@ -8,10 +8,10 @@ import (
 )
 
 var (
-	ErrWorkerStopped = errors.New("worker pool has been stopped")
-	ErrTaskTimeout   = errors.New("task execution timeout")
-	ErrPoolFull      = errors.New("worker pool queue is full")
-	ErrInvalidConfig = errors.New("invalid worker pool configuration")
+	ErrWorkerStopped  = errors.New("worker pool has been stopped")
+	ErrNotInitialized = errors.New("worker tasks channel not initialized, call Start() first")
+	ErrScaleFailure   = errors.New("failed to scale down workers")
+	ErrTaskCancelled  = errors.New("task execution canceled")
 )
 
 // Options 定义了工作池的配置选项。

@@ -54,7 +54,7 @@ func (w *worker[T]) Submit(ctx context.Context, task func() T, ch chan<- Result[
 	}
 
 	if w.tasks == nil {
-		return errors.New("worker tasks channel not initialized, call Start() first")
+		return ErrNotInitialized
 	}
 	select {
 	case <-ctx.Done():
@@ -137,7 +137,7 @@ func (w *worker[T]) Scale(delta int) error {
 			select {
 			case w.quit <- struct{}{}:
 			case <-time.After(10 * time.Millisecond):
-				return errors.New("failed to scale down workers")
+				return ErrScaleFailure
 			}
 		}
 	}

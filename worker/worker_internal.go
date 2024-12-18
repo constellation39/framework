@@ -60,7 +60,7 @@ func (w *worker[T]) executeTask(task Task[T]) error {
 		w.handleTaskCompletion(task, *new(T), err, start)
 		return err
 	case <-w.ctx.Done():
-		err := fmt.Errorf("task execution canceled: %v", w.ctx.Err())
+		err := fmt.Errorf("%w: %v", ErrTaskCancelled, w.ctx.Err())
 		w.handleTaskCompletion(task, *new(T), err, start)
 		return err
 	}
