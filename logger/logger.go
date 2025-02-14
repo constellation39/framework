@@ -2,54 +2,20 @@ package logger
 
 import (
 	"fmt"
-	"os"
-	"path"
-	"runtime"
-
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
 	"gopkg.in/natefinch/lumberjack.v2"
+	"os"
 )
-
-// Logger 定义日志接口，包含常用日志方法和本例中的新方法 WithCallerSkip。
-type Logger interface {
-	Debug(msg string, fields ...zapcore.Field)
-	Info(msg string, fields ...zapcore.Field)
-	Warn(msg string, fields ...zapcore.Field)
-	Error(msg string, fields ...zapcore.Field)
-	DPanic(msg string, fields ...zapcore.Field)
-	Panic(msg string, fields ...zapcore.Field)
-	Fatal(msg string, fields ...zapcore.Field)
-
-	// Sync 用于刷新缓冲区，一般在程序退出前调用。
-	Sync() error
-
-	// WithCallerSkip 创建一个新的 Logger 并调整 caller skip。
-	WithCallerSkip(skip int) Logger
-
-	// With 也是常用功能：生成新的 Logger 并携带一些固定字段。
-	With(fields ...zapcore.Field) Logger
-}
 
 // Options 定义日志配置选项
 type Options struct {
-	// Level 指定日志级别，比如 zapcore.DebugLevel, zapcore.InfoLevel 等
-	Level zapcore.Level
-
-	// Filename 指定日志输出文件名，不为空则文件输出，空则只输出到控制台
-	Filename string
-
-	// Stdout 为 true 时会输出到控制台
-	Stdout bool
-
-	// 文件轮转配置
-	Rotation RotationOptions
-
-	// CallerSkip 设置 zap 内部调用层数的跳过数量
-	CallerSkip int
-
-	// Fields 允许在 logger 初始化时就预带特定字段
-	Fields []zap.Field
+	Level      zapcore.Level // 日志级别
+	Filename   string        // 文件名，不为空则输出到文件
+	Stdout     bool          // 是否同时输出到控制台
+	Rotation   RotationOptions
+	CallerSkip int         // 在封装场景下需要的 caller skip
+	Fields     []zap.Field // 初始化时默认附加的字段
 }
 
 // RotationOptions 定义日志轮转配置
@@ -58,7 +24,7 @@ type RotationOptions struct {
 	MaxBackups int  // 保留旧文件个数
 	MaxAge     int  // 保留天数
 	Compress   bool // 是否压缩
-	LocalTime  bool // 使用本地时间
+	LocalTime  bool // 是否使用本地时间
 }
 
 // DefaultOptions 返回一套默认日志配置
@@ -74,38 +40,15 @@ func DefaultOptions() Options {
 			Compress:   true,
 			LocalTime:  true,
 		},
-		// 通常在 logger 包内封装一层时设为 1
-		CallerSkip: 1,
+		CallerSkip: 0,
 	}
 }
 
-// zapLogger 是 Logger 接口的具体实现，基于 zap。
-type zapLogger struct {
-	base *zap.Logger
-	// 保存 Options，以便二次复制或更新
-	opts Options
-	// 可选：你也可以保留 sugared logger 或 stdLog 等
-}
-
-// New 创建新的 Logger (基于 zap) 并返回 Logger 接口
-func New(opts Options) (Logger, error) {
-	// 构建底层 zap.Logger
-	zLogger, err := newZapLogger(opts)
-	if err != nil {
-		return nil, err
-	}
-	return &zapLogger{
-		base: zLogger,
-		opts: opts,
-	}, nil
-}
-
-// 下面是辅助函数 newZapLogger 用于构建 raw zap.Logger
-func newZapLogger(opts Options) (*zap.Logger, error) {
+// NewLogger 以最小封装的方式，返回 *zap.Logger
+func NewLogger(opts Options) (*zap.Logger, error) {
 	encodingConfig := zapcore.EncoderConfig{
 		TimeKey:        "time",
 		LevelKey:       "level",
-		NameKey:        "logger",
 		CallerKey:      "caller",
 		MessageKey:     "msg",
 		StacktraceKey:  "stacktrace",
@@ -118,9 +61,9 @@ func newZapLogger(opts Options) (*zap.Logger, error) {
 
 	var cores []zapcore.Core
 
-	// 如果指定了文件名，则输出到文件(使用 JSON 编码)
+	// 如果 Filename 不为空，则输出到文件；此处用 JSON 编码
 	if opts.Filename != "" {
-		fileWriter := zapcore.AddSync(&lumberjack.Logger{
+		w := zapcore.AddSync(&lumberjack.Logger{
 			Filename:   opts.Filename,
 			MaxSize:    opts.Rotation.MaxSize,
 			MaxBackups: opts.Rotation.MaxBackups,
@@ -128,15 +71,16 @@ func newZapLogger(opts Options) (*zap.Logger, error) {
 			Compress:   opts.Rotation.Compress,
 			LocalTime:  opts.Rotation.LocalTime,
 		})
-		jsonEncoder := zapcore.NewJSONEncoder(encodingConfig)
-		cores = append(cores, zapcore.NewCore(jsonEncoder, fileWriter, zapcore.DebugLevel))
+		jsonEnc := zapcore.NewJSONEncoder(encodingConfig)
+		// 设置为 DebugLevel 是为了让文件里面可以吃到比 console 更多的日志
+		cores = append(cores, zapcore.NewCore(jsonEnc, w, zapcore.DebugLevel))
 	}
 
-	// 若需要输出到控制台，则使用 ConsoleEncoder
+	// 如果 Stdout 为 true，则再输出到控制台；此处用 Console 编码
 	if opts.Stdout {
-		consoleEncoder := zapcore.NewConsoleEncoder(encodingConfig)
+		consoleEnc := zapcore.NewConsoleEncoder(encodingConfig)
 		consoleWriter := zapcore.AddSync(os.Stdout)
-		cores = append(cores, zapcore.NewCore(consoleEncoder, consoleWriter, opts.Level))
+		cores = append(cores, zapcore.NewCore(consoleEnc, consoleWriter, opts.Level))
 	}
 
 	if len(cores) == 0 {
@@ -145,109 +89,31 @@ func newZapLogger(opts Options) (*zap.Logger, error) {
 
 	zapOpts := []zap.Option{
 		zap.AddCaller(),
+		zap.AddStacktrace(zapcore.WarnLevel),
 	}
-	// 如果是 Debug 级别，可加入 zap.Development() 方便调试
+	// 如果要在 debug 模式下，需要 zap.Development()
 	if opts.Level == zapcore.DebugLevel {
 		zapOpts = append(zapOpts, zap.Development())
 	}
-	// 如果设置了 callerSkip
+	// 如果有 callerSkip
 	if opts.CallerSkip > 0 {
 		zapOpts = append(zapOpts, zap.AddCallerSkip(opts.CallerSkip))
 	}
-	// 如果有初始需要附加的字段
+	// 如果有初始化 Fields
 	if len(opts.Fields) > 0 {
 		zapOpts = append(zapOpts, zap.Fields(opts.Fields...))
 	}
 
-	// 构建 zap.Logger
-	return zap.New(zapcore.NewTee(cores...),
-		zapOpts...,
-	), nil
+	logger := zap.New(zapcore.NewTee(cores...), zapOpts...)
+	return logger, nil
 }
 
-// -------------------------------------------
-// 实现 Logger 接口的方法
-// -------------------------------------------
-
-func (l *zapLogger) Debug(msg string, fields ...zapcore.Field) {
-	l.base.Debug(msg, fields...)
-}
-
-func (l *zapLogger) Info(msg string, fields ...zapcore.Field) {
-	l.base.Info(msg, fields...)
-}
-
-func (l *zapLogger) Warn(msg string, fields ...zapcore.Field) {
-	l.base.Warn(msg, fields...)
-}
-
-func (l *zapLogger) Error(msg string, fields ...zapcore.Field) {
-	l.base.Error(msg, fields...)
-}
-
-func (l *zapLogger) DPanic(msg string, fields ...zapcore.Field) {
-	l.base.DPanic(msg, fields...)
-}
-
-func (l *zapLogger) Panic(msg string, fields ...zapcore.Field) {
-	l.base.Panic(msg, fields...)
-}
-
-func (l *zapLogger) Fatal(msg string, fields ...zapcore.Field) {
-	l.base.Fatal(msg, fields...)
-}
-
-// Sync 用于刷新写缓冲
-func (l *zapLogger) Sync() error {
-	return l.base.Sync()
-}
-
-// With 用于在当前 Logger 基础上附加一些字段
-func (l *zapLogger) With(fields ...zapcore.Field) Logger {
-	newLogger := &zapLogger{
-		// 直接复用当前 zap.Logger，然后调用 With(fields...)
-		base: l.base.With(fields...),
-		opts: l.opts,
-	}
-	return newLogger
-}
-
-// WithCallerSkip 根据当前 logger 的配置，创建一个新的 logger
-// 并增加(或覆盖) callerSkip，使日志能正确定位到你想要的调用层级。
-func (l *zapLogger) WithCallerSkip(skip int) Logger {
-	// 复制一份原有 opts
-	newOpts := l.opts
-	// 覆盖 callerSkip
-	newOpts.CallerSkip = skip
-
-	// 可选：这里也能动态添加“module”字段，便于区分日志来源。
-	// 下面是示例：用 runtime 获取调用方函数名
-	if len(newOpts.Fields) == 0 {
-		newOpts.Fields = make([]zap.Field, 0)
-	}
-	if pc, _, _, ok := runtime.Caller(1); ok {
-		if fn := runtime.FuncForPC(pc); fn != nil {
-			newOpts.Fields = append(newOpts.Fields, zap.String("module", path.Base(fn.Name())))
-		}
-	}
-
-	zLogger, err := newZapLogger(newOpts)
+// NewDefaultLogger 快速创建一个默认 logger (若你想直接用)
+func NewDefaultLogger() *zap.Logger {
+	opts := DefaultOptions()
+	logger, err := NewLogger(opts)
 	if err != nil {
-		// 如果因为某些不常见错误创建失败，这里可以返回原 logger 以防止 crash
-		return l
+		panic(fmt.Errorf("failed to create default logger: %v", err))
 	}
-
-	return &zapLogger{
-		base: zLogger,
-		opts: newOpts,
-	}
-}
-
-// NewDefaultLogger 快速创建一个默认 logger
-func NewDefaultLogger() Logger {
-	l, err := New(DefaultOptions())
-	if err != nil {
-		panic(fmt.Sprintf("failed to create default logger: %v", err))
-	}
-	return l
+	return logger
 }
