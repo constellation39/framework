@@ -1,4 +1,4 @@
-module framework
+module github.com/constellation39/framework
 
 go 1.24.0
 
