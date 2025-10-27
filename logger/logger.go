@@ -56,6 +56,7 @@ type Config struct {
 }
 
 // 默认配置
+// 默认配置
 func defaultConfig() *Config {
 	return &Config{
 		Level:            "info",
@@ -64,10 +65,10 @@ func defaultConfig() *Config {
 		EnableFile:       true,
 		LogDir:           "logs",
 		Filename:         "app",
-		MaxAge:           7,
+		MaxAge:           0,        // 设为 0，不使用时间清理
 		RotationTime:     24,
 		RotationSize:     100,
-		RotationCount:    10,
+		RotationCount:    10,       // 使用数量清理，保留 10 个文件
 		CompressOldLog:   false,
 		EnableConsole:    true,
 		ColorConsole:     true,
@@ -80,6 +81,7 @@ func defaultConfig() *Config {
 		SamplingAfter:    100,
 	}
 }
+
 
 // New 创建新的日志实例
 func New(opts ...Option) (*Logger, error) {
@@ -208,23 +210,22 @@ func buildFileCore(cfg *Config, level zapcore.Level) (zapcore.Core, io.Closer, e
 	linkPath := filepath.Join(cfg.LogDir, cfg.Filename+".log")
 
 	// 配置 rotatelogs
-	// Note: the rotatelogs library does not allow MaxAge and RotationCount
-	// to be set simultaneously. Prefer RotationCount when provided by the
-	// user/config; otherwise fall back to MaxAge.
 	rotateOpts := []rotatelogs.Option{
 		rotatelogs.WithLinkName(linkPath),
 		rotatelogs.WithRotationTime(time.Duration(cfg.RotationTime) * time.Hour),
 	}
 
+	// 添加轮转大小配置
 	if cfg.RotationSize > 0 {
 		rotateOpts = append(rotateOpts, rotatelogs.WithRotationSize(cfg.RotationSize*1024*1024))
 	}
 
+	// RotationCount 和 MaxAge 二选一
+	// 优先使用 RotationCount，如果为 0 则使用 MaxAge
 	if cfg.RotationCount > 0 {
-		// Use RotationCount and do not set MaxAge
 		rotateOpts = append(rotateOpts, rotatelogs.WithRotationCount(cfg.RotationCount))
 	} else if cfg.MaxAge > 0 {
-		rotateOpts = append(rotateOpts, rotatelogs.WithMaxAge(time.Duration(cfg.MaxAge) * 24 * time.Hour))
+		rotateOpts = append(rotateOpts, rotatelogs.WithMaxAge(time.Duration(cfg.MaxAge)*24*time.Hour))
 	}
 
 	// 创建 rotatelogs
