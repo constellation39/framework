@@ -208,9 +208,11 @@ func buildFileCore(cfg *Config, level zapcore.Level) (zapcore.Core, io.Closer, e
 	linkPath := filepath.Join(cfg.LogDir, cfg.Filename+".log")
 
 	// 配置 rotatelogs
+	// Note: the rotatelogs library does not allow MaxAge and RotationCount
+	// to be set simultaneously. Prefer RotationCount when provided by the
+	// user/config; otherwise fall back to MaxAge.
 	rotateOpts := []rotatelogs.Option{
 		rotatelogs.WithLinkName(linkPath),
-		rotatelogs.WithMaxAge(time.Duration(cfg.MaxAge) * 24 * time.Hour),
 		rotatelogs.WithRotationTime(time.Duration(cfg.RotationTime) * time.Hour),
 	}
 
@@ -219,7 +221,10 @@ func buildFileCore(cfg *Config, level zapcore.Level) (zapcore.Core, io.Closer, e
 	}
 
 	if cfg.RotationCount > 0 {
+		// Use RotationCount and do not set MaxAge
 		rotateOpts = append(rotateOpts, rotatelogs.WithRotationCount(cfg.RotationCount))
+	} else if cfg.MaxAge > 0 {
+		rotateOpts = append(rotateOpts, rotatelogs.WithMaxAge(time.Duration(cfg.MaxAge) * 24 * time.Hour))
 	}
 
 	// 创建 rotatelogs
