@@ -1,443 +1,414 @@
 package logger
 
 import (
-	"context"
-	"encoding/json"
-	"errors"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"os"
+	"path/filepath"
 	"strings"
+	"sync"
+	"time"
 
+	rotatelogs "github.com/lestrrat-go/file-rotatelogs"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
-	"gopkg.in/natefinch/lumberjack.v2"
-	"gopkg.in/yaml.v2"
 )
 
-/*
-Package logger 提供了一个基于zap的日志系统，具有以下特性：
-- 简单易用的API
-- 高性能的日志记录
-- 灵活的配置选项
-- 上下文感知
-- 文件轮转支持
-- 多级别输出控制
-- 配置文件支持
-- 错误恢复机制
-
-基本使用:
-    logger, _ := logger.New(logger.WithLevel(zapcore.InfoLevel))
-    logger.Info("这是一条信息日志")
-    logger.Error("发生错误", zap.Error(err))
-
-上下文使用:
-    ctx := context.Background()
-    ctxLogger, _ := logger.NewLoggerWithContext(ctx)
-    ctxLogger.Info("带有上下文的日志")
-
-配置文件使用:
-    logger, _ := logger.FromConfig("config.yaml")
-*/
-
-// 默认值常量
-const (
-	DefaultMaxSize    = 100 // 默认日志文件最大尺寸(MB)
-	DefaultMaxBackups = 3   // 默认保留的备份数
-	DefaultMaxAge     = 28  // 默认日志保留天数
-)
-
-// 预定义错误
-var (
-	ErrNoOutputConfigured = errors.New("logger: no output configured")
-)
-
-// Options 定义日志配置选项
-type Options struct {
-	Level      zapcore.Level // 日志级别
-	Filename   string        // 文件名，不为空则输出到文件
-	Stdout     bool          // 是否同时输出到控制台
-	Rotation   RotationOptions
-	CallerSkip int         // 在封装场景下需要的 caller skip
-	Fields     []zap.Field // 初始化时默认附加的字段
+// Logger 封装了 zap.Logger 和相关资源
+type Logger struct {
+	*zap.Logger
+	sugar      *zap.SugaredLogger
+	rotateLog  io.Closer
+	config     *Config
+	callerOnce sync.Once
+	callerPath string
 }
 
-// RotationOptions 定义日志轮转配置
-type RotationOptions struct {
-	MaxSize    int  // MB
-	MaxBackups int  // 保留旧文件个数
-	MaxAge     int  // 保留天数
-	Compress   bool // 是否压缩
-	LocalTime  bool // 是否使用本地时间
+// Config 日志配置
+type Config struct {
+	// 基础配置
+	Level       string `json:"level" yaml:"level"`             // 日志级别: debug, info, warn, error
+	Encoding    string `json:"encoding" yaml:"encoding"`       // 编码格式: json, console
+	Environment string `json:"environment" yaml:"environment"` // 环境: development, production
+
+	// 文件配置
+	EnableFile     bool   `json:"enable_file" yaml:"enable_file"`           // 是否启用文件输出
+	LogDir         string `json:"log_dir" yaml:"log_dir"`                   // 日志目录
+	Filename       string `json:"filename" yaml:"filename"`                 // 日志文件名前缀
+	MaxAge         int    `json:"max_age" yaml:"max_age"`                   // 日志保留天数
+	RotationTime   int    `json:"rotation_time" yaml:"rotation_time"`       // 轮转时间(小时)
+	RotationSize   int64  `json:"rotation_size" yaml:"rotation_size"`       // 轮转大小(MB)
+	RotationCount  uint   `json:"rotation_count" yaml:"rotation_count"`     // 保留文件数量
+	CompressOldLog bool   `json:"compress_old_log" yaml:"compress_old_log"` // 是否压缩旧日志
+
+	// 控制台配置
+	EnableConsole bool `json:"enable_console" yaml:"enable_console"` // 是否启用控制台输出
+	ColorConsole  bool `json:"color_console" yaml:"color_console"`   // 控制台是否彩色输出
+
+	// 高级配置
+	EnableStacktrace bool   `json:"enable_stacktrace" yaml:"enable_stacktrace"` // 是否启用堆栈跟踪
+	StacktraceLevel  string `json:"stacktrace_level" yaml:"stacktrace_level"`   // 堆栈跟踪级别
+	MaxStackFrames   int    `json:"max_stack_frames" yaml:"max_stack_frames"`   // 最大堆栈帧数
+	CallerSkip       int    `json:"caller_skip" yaml:"caller_skip"`             // 调用者跳过层数
+	EnableSampling   bool   `json:"enable_sampling" yaml:"enable_sampling"`     // 是否启用采样
+	SamplingInitial  int    `json:"sampling_initial" yaml:"sampling_initial"`   // 采样初始值
+	SamplingAfter    int    `json:"sampling_after" yaml:"sampling_after"`       // 采样之后值
 }
 
-// DefaultOptions 返回一套默认日志配置
-func DefaultOptions() Options {
-	return Options{
-		Level:    zapcore.InfoLevel,
-		Stdout:   true,
-		Filename: "",
-		Rotation: RotationOptions{
-			MaxSize:    DefaultMaxSize,
-			MaxBackups: DefaultMaxBackups,
-			MaxAge:     DefaultMaxAge,
-			Compress:   true,
-			LocalTime:  true,
-		},
-		CallerSkip: 0,
+// 默认配置
+func defaultConfig() *Config {
+	return &Config{
+		Level:            "info",
+		Encoding:         "console",
+		Environment:      "development",
+		EnableFile:       true,
+		LogDir:           "logs",
+		Filename:         "app",
+		MaxAge:           7,
+		RotationTime:     24,
+		RotationSize:     100,
+		RotationCount:    10,
+		CompressOldLog:   false,
+		EnableConsole:    true,
+		ColorConsole:     true,
+		EnableStacktrace: true,
+		StacktraceLevel:  "error",
+		MaxStackFrames:   10,
+		CallerSkip:       0,
+		EnableSampling:   false,
+		SamplingInitial:  100,
+		SamplingAfter:    100,
 	}
 }
 
-// LoggerOption 定义一个修改Logger选项的函数类型
-type LoggerOption func(*Options)
+// New 创建新的日志实例
+func New(opts ...Option) (*Logger, error) {
+	cfg := defaultConfig()
 
-// WithLevel 设置日志级别
-func WithLevel(level zapcore.Level) LoggerOption {
-	return func(o *Options) {
-		o.Level = level
-	}
-}
-
-// WithStdout 设置是否输出到控制台
-func WithStdout(enable bool) LoggerOption {
-	return func(o *Options) {
-		o.Stdout = enable
-	}
-}
-
-// WithFile 设置日志文件
-func WithFile(filename string) LoggerOption {
-	return func(o *Options) {
-		o.Filename = filename
-	}
-}
-
-// WithRotation 设置日志轮转选项
-func WithRotation(opts RotationOptions) LoggerOption {
-	return func(o *Options) {
-		o.Rotation = opts
-	}
-}
-
-// WithRotationValues 通过直接值设置日志轮转选项
-func WithRotationValues(maxSize, maxBackups, maxAge int, compress, localTime bool) LoggerOption {
-	return WithRotation(RotationOptions{
-		MaxSize:    maxSize,
-		MaxBackups: maxBackups,
-		MaxAge:     maxAge,
-		Compress:   compress,
-		LocalTime:  localTime,
-	})
-}
-
-// WithCallerSkip 设置调用者跳过层级
-func WithCallerSkip(skip int) LoggerOption {
-	return func(o *Options) {
-		o.CallerSkip = skip
-	}
-}
-
-// WithFields 添加默认字段
-func WithFields(fields ...zap.Field) LoggerOption {
-	return func(o *Options) {
-		o.Fields = append(o.Fields, fields...)
-	}
-}
-
-// newEncoderConfig 返回标准的编码器配置
-func newEncoderConfig() zapcore.EncoderConfig {
-	return zapcore.EncoderConfig{
-		TimeKey:        "time",
-		LevelKey:       "level",
-		CallerKey:      "caller",
-		MessageKey:     "msg",
-		StacktraceKey:  "stacktrace",
-		LineEnding:     zapcore.DefaultLineEnding,
-		EncodeLevel:    zapcore.CapitalLevelEncoder,
-		EncodeTime:     zapcore.ISO8601TimeEncoder,
-		EncodeDuration: zapcore.StringDurationEncoder,
-		EncodeCaller:   zapcore.ShortCallerEncoder,
-	}
-}
-
-// New 使用函数选项模式创建日志器
-func New(opts ...LoggerOption) (*zap.Logger, error) {
-	// 应用默认选项
-	options := DefaultOptions()
-
-	// 应用用户提供的选项
+	// 应用选项
 	for _, opt := range opts {
-		opt(&options)
+		opt(cfg)
 	}
 
-	var cores []zapcore.Core
-
-	// 添加文件输出
-	if options.Filename != "" {
-		lumberjackLogger := &lumberjack.Logger{
-			Filename:   options.Filename,
-			MaxSize:    options.Rotation.MaxSize,
-			MaxBackups: options.Rotation.MaxBackups,
-			MaxAge:     options.Rotation.MaxAge,
-			Compress:   options.Rotation.Compress,
-			LocalTime:  options.Rotation.LocalTime,
+	// 根据环境自动调整默认值
+	if cfg.Environment == "production" {
+		if cfg.Encoding == "console" {
+			cfg.Encoding = "json"
 		}
-
-		fileCore := zapcore.NewCore(
-			zapcore.NewJSONEncoder(newEncoderConfig()),
-			zapcore.AddSync(lumberjackLogger),
-			options.Level,
-		)
-		cores = append(cores, fileCore)
+		if !cfg.EnableSampling {
+			cfg.EnableSampling = true
+		}
+		cfg.ColorConsole = false
 	}
 
-	// 添加控制台输出
-	if options.Stdout {
-		consoleCore := zapcore.NewCore(
-			zapcore.NewConsoleEncoder(newEncoderConfig()),
-			zapcore.AddSync(os.Stdout),
-			options.Level,
-		)
+	return newLogger(cfg)
+}
+
+// MustNew 创建日志实例，失败则 panic
+func MustNew(opts ...Option) *Logger {
+	logger, err := New(opts...)
+	if err != nil {
+		panic(fmt.Sprintf("failed to create logger: %v", err))
+	}
+	return logger
+}
+
+func newLogger(cfg *Config) (*Logger, error) {
+	// 解析日志级别
+	level, err := parseLevel(cfg.Level)
+	if err != nil {
+		return nil, fmt.Errorf("invalid log level %s: %w", cfg.Level, err)
+	}
+
+	// 解析堆栈跟踪级别
+	stackLevel, err := parseLevel(cfg.StacktraceLevel)
+	if err != nil {
+		return nil, fmt.Errorf("invalid stacktrace level %s: %w", cfg.StacktraceLevel, err)
+	}
+
+	// 构建 cores
+	cores := make([]zapcore.Core, 0, 2)
+	var rotateLog io.Closer
+
+	// 文件输出
+	if cfg.EnableFile {
+		fileCore, rl, err := buildFileCore(cfg, level)
+		if err != nil {
+			return nil, fmt.Errorf("failed to build file core: %w", err)
+		}
+		cores = append(cores, fileCore)
+		rotateLog = rl
+	}
+
+	// 控制台输出
+	if cfg.EnableConsole {
+		consoleCore := buildConsoleCore(cfg, level)
 		cores = append(cores, consoleCore)
 	}
 
-	// 检查是否有输出配置
 	if len(cores) == 0 {
-		return nil, ErrNoOutputConfigured
+		return nil, fmt.Errorf("at least one output (file or console) must be enabled")
 	}
 
-	// 构建基本 Zap 选项
+	// 组合多个 core
+	core := zapcore.NewTee(cores...)
+
+	// 包装堆栈截断
+	if cfg.EnableStacktrace && cfg.MaxStackFrames > 0 {
+		core = &stackTrimCore{
+			Core:      core,
+			maxFrames: cfg.MaxStackFrames,
+		}
+	}
+
+	// 构建选项
 	zapOpts := []zap.Option{
 		zap.AddCaller(),
-		zap.AddStacktrace(zapcore.WarnLevel),
+		zap.AddCallerSkip(cfg.CallerSkip),
 	}
 
-	// 添加额外选项
-	if options.Level == zapcore.DebugLevel {
-		zapOpts = append(zapOpts, zap.Development())
+	if cfg.EnableStacktrace {
+		zapOpts = append(zapOpts, zap.AddStacktrace(stackLevel))
 	}
 
-	if options.CallerSkip > 0 {
-		zapOpts = append(zapOpts, zap.AddCallerSkip(options.CallerSkip))
+	// 添加采样
+	if cfg.EnableSampling {
+		zapOpts = append(zapOpts, zap.WrapCore(func(c zapcore.Core) zapcore.Core {
+			return zapcore.NewSamplerWithOptions(
+				c,
+				time.Second,
+				cfg.SamplingInitial,
+				cfg.SamplingAfter,
+			)
+		}))
 	}
 
-	if len(options.Fields) > 0 {
-		zapOpts = append(zapOpts, zap.Fields(options.Fields...))
+	// 创建 logger
+	zapLogger := zap.New(core, zapOpts...)
+
+	logger := &Logger{
+		Logger:    zapLogger,
+		sugar:     zapLogger.Sugar(),
+		rotateLog: rotateLog,
+		config:    cfg,
 	}
 
-	// 创建并返回 logger
-	return zap.New(zapcore.NewTee(cores...), zapOpts...), nil
+	return logger, nil
 }
 
-// MustNew 创建日志器或panic
-func MustNew(opts ...LoggerOption) *zap.Logger {
-	logger, err := New(opts...)
+// buildFileCore 构建文件输出 core
+func buildFileCore(cfg *Config, level zapcore.Level) (zapcore.Core, io.Closer, error) {
+	// 创建日志目录
+	if err := os.MkdirAll(cfg.LogDir, 0755); err != nil {
+		return nil, nil, fmt.Errorf("failed to create log directory: %w", err)
+	}
+
+	// 构建日志文件路径
+	logPath := filepath.Join(cfg.LogDir, cfg.Filename+".%Y%m%d.log")
+	linkPath := filepath.Join(cfg.LogDir, cfg.Filename+".log")
+
+	// 配置 rotatelogs
+	rotateOpts := []rotatelogs.Option{
+		rotatelogs.WithLinkName(linkPath),
+		rotatelogs.WithMaxAge(time.Duration(cfg.MaxAge) * 24 * time.Hour),
+		rotatelogs.WithRotationTime(time.Duration(cfg.RotationTime) * time.Hour),
+	}
+
+	if cfg.RotationSize > 0 {
+		rotateOpts = append(rotateOpts, rotatelogs.WithRotationSize(cfg.RotationSize*1024*1024))
+	}
+
+	if cfg.RotationCount > 0 {
+		rotateOpts = append(rotateOpts, rotatelogs.WithRotationCount(cfg.RotationCount))
+	}
+
+	// 创建 rotatelogs
+	logWriter, err := rotatelogs.New(logPath, rotateOpts...)
 	if err != nil {
-		panic(fmt.Errorf("failed to create logger: %w", err))
+		return nil, nil, fmt.Errorf("failed to create rotatelogs: %w", err)
 	}
-	return logger
+
+	// 构建编码器
+	encoder := buildEncoder(cfg, false)
+
+	core := zapcore.NewCore(
+		encoder,
+		zapcore.AddSync(logWriter),
+		level,
+	)
+
+	return core, logWriter, nil
 }
 
-// NewDefaultLogger 创建默认日志器
-func NewDefaultLogger() (*zap.Logger, error) {
-	return New()
-}
+// buildConsoleCore 构建控制台输出 core
+func buildConsoleCore(cfg *Config, level zapcore.Level) zapcore.Core {
+	encoder := buildEncoder(cfg, true)
 
-// MustNewDefaultLogger 创建默认日志器或panic
-func MustNewDefaultLogger() *zap.Logger {
-	return MustNew()
-}
-
-// NewDevelopmentLogger 创建适合开发环境的日志器
-func NewDevelopmentLogger() (*zap.Logger, error) {
-	return New(WithLevel(zapcore.DebugLevel))
-}
-
-// NewProductionLogger 创建适合生产环境的日志器
-func NewProductionLogger(filename string) (*zap.Logger, error) {
-	if filename == "" {
-		return nil, fmt.Errorf("production logger requires a filename")
-	}
-	return New(
-		WithLevel(zapcore.InfoLevel),
-		WithStdout(false),
-		WithFile(filename),
+	return zapcore.NewCore(
+		encoder,
+		zapcore.AddSync(os.Stdout),
+		level,
 	)
 }
 
-// extractFieldsFromContext 从上下文中提取字段
-func extractFieldsFromContext(ctx context.Context) []zap.Field {
-	var fields []zap.Field
-	// 这里可以根据需要从上下文提取信息转换为字段
-	return fields
-}
+// buildEncoder 构建编码器
+func buildEncoder(cfg *Config, isConsole bool) zapcore.Encoder {
+	var encoderConfig zapcore.EncoderConfig
 
-// NewLoggerWithContext 创建带有上下文信息的日志器
-func NewLoggerWithContext(ctx context.Context, options ...LoggerOption) (*zap.Logger, error) {
-	// 从上下文中提取字段
-	fields := extractFieldsFromContext(ctx)
-
-	// 将上下文字段添加到选项中
-	ctxOptions := append([]LoggerOption{WithFields(fields...)}, options...)
-
-	// 创建日志器并直接返回zap.Logger
-	return New(ctxOptions...)
-}
-
-// WithContext 为现有的logger添加上下文信息
-func WithContext(logger *zap.Logger, ctx context.Context) *zap.Logger {
-	if logger == nil || ctx == nil {
-		return logger
+	if cfg.Environment == "production" {
+		encoderConfig = zap.NewProductionEncoderConfig()
+	} else {
+		encoderConfig = zap.NewDevelopmentEncoderConfig()
 	}
 
-	fields := extractFieldsFromContext(ctx)
-	if len(fields) == 0 {
-		return logger
-	}
+	// 统一字段名
+	encoderConfig.TimeKey = "time"
+	encoderConfig.LevelKey = "level"
+	encoderConfig.NameKey = "logger"
+	encoderConfig.CallerKey = "caller"
+	encoderConfig.FunctionKey = zapcore.OmitKey
+	encoderConfig.MessageKey = "msg"
+	encoderConfig.StacktraceKey = "stacktrace"
+	encoderConfig.LineEnding = zapcore.DefaultLineEnding
+	encoderConfig.EncodeTime = zapcore.ISO8601TimeEncoder
+	encoderConfig.EncodeDuration = zapcore.MillisDurationEncoder
 
-	return logger.With(fields...)
-}
-
-// 配置文件支持
-
-// ConfigFileFormat 表示配置文件格式
-type ConfigFileFormat int
-
-const (
-	FormatJSON ConfigFileFormat = iota
-	FormatYAML
-)
-
-// FromConfig 从配置文件创建日志器
-func FromConfig(configPath string) (*zap.Logger, error) {
-	format := FormatJSON
-	if strings.HasSuffix(strings.ToLower(configPath), ".yaml") ||
-		strings.HasSuffix(strings.ToLower(configPath), ".yml") {
-		format = FormatYAML
-	}
-
-	config, err := loadConfigFile(configPath, format)
-	if err != nil {
-		return nil, fmt.Errorf("failed to load logger config: %w", err)
-	}
-
-	// 转换配置到选项
-	opts := []LoggerOption{
-		WithLevel(config.Level),
-		WithStdout(config.Stdout),
-		WithCallerSkip(config.CallerSkip),
-	}
-
-	if config.Filename != "" {
-		opts = append(opts, WithFile(config.Filename))
-		opts = append(opts, WithRotation(config.Rotation))
-	}
-
-	if len(config.Fields) > 0 {
-		opts = append(opts, WithFields(config.Fields...))
-	}
-
-	// 创建日志器
-	return New(opts...)
-}
-
-// loadConfigFile 从文件加载配置
-func loadConfigFile(path string, format ConfigFileFormat) (Options, error) {
-	data, err := ioutil.ReadFile(path)
-	if err != nil {
-		return DefaultOptions(), fmt.Errorf("failed to read config file: %w", err)
-	}
-
-	options := DefaultOptions()
-
-	switch format {
-	case FormatJSON:
-		if err := json.Unmarshal(data, &options); err != nil {
-			return DefaultOptions(), fmt.Errorf("failed to parse JSON config: %w", err)
+	// 控制台特殊配置
+	if isConsole {
+		encoderConfig.EncodeCaller = relativeCallerEncoder
+		if cfg.ColorConsole {
+			encoderConfig.EncodeLevel = zapcore.CapitalColorLevelEncoder
+		} else {
+			encoderConfig.EncodeLevel = zapcore.CapitalLevelEncoder
 		}
-	case FormatYAML:
-		if err := yaml.Unmarshal(data, &options); err != nil {
-			return DefaultOptions(), fmt.Errorf("failed to parse YAML config: %w", err)
-		}
+	} else {
+		encoderConfig.EncodeCaller = zapcore.ShortCallerEncoder
+		encoderConfig.EncodeLevel = zapcore.LowercaseLevelEncoder
+	}
+
+	// 根据编码格式创建编码器
+	if cfg.Encoding == "json" || !isConsole {
+		return zapcore.NewJSONEncoder(encoderConfig)
+	}
+	return zapcore.NewConsoleEncoder(encoderConfig)
+}
+
+// parseLevel 解析日志级别
+func parseLevel(level string) (zapcore.Level, error) {
+	switch strings.ToLower(level) {
+	case "debug":
+		return zap.DebugLevel, nil
+	case "info":
+		return zap.InfoLevel, nil
+	case "warn", "warning":
+		return zap.WarnLevel, nil
+	case "error":
+		return zap.ErrorLevel, nil
+	case "dpanic":
+		return zap.DPanicLevel, nil
+	case "panic":
+		return zap.PanicLevel, nil
+	case "fatal":
+		return zap.FatalLevel, nil
 	default:
-		return DefaultOptions(), fmt.Errorf("unsupported config format")
+		return zap.InfoLevel, fmt.Errorf("unknown level: %s", level)
 	}
-
-	return options, nil
 }
 
-// MustFromConfig 从配置文件创建日志器或panic
-func MustFromConfig(configPath string) *zap.Logger {
-	logger, err := FromConfig(configPath)
+// relativeCallerEncoder 相对路径编码器
+func relativeCallerEncoder(caller zapcore.EntryCaller, enc zapcore.PrimitiveArrayEncoder) {
+	// 只计算一次工作目录
+	l := globalLogger.Load()
+	if l == nil {
+		zapcore.ShortCallerEncoder(caller, enc)
+		return
+	}
+
+	logger := l.(*Logger)
+	logger.callerOnce.Do(func() {
+		logger.callerPath, _ = os.Getwd()
+	})
+
+	if logger.callerPath == "" {
+		zapcore.ShortCallerEncoder(caller, enc)
+		return
+	}
+
+	relPath, err := filepath.Rel(logger.callerPath, caller.File)
 	if err != nil {
-		panic(fmt.Errorf("failed to create logger from config: %w", err))
+		zapcore.ShortCallerEncoder(caller, enc)
+		return
 	}
-	return logger
+
+	enc.AppendString(fmt.Sprintf("%s:%d", relPath, caller.Line))
 }
 
-// 全局日志器和辅助函数
+// stackTrimCore 堆栈截断核心
+type stackTrimCore struct {
+	zapcore.Core
+	maxFrames int
+}
 
-// 全局日志器，可以通过SetGlobalLogger设置
-var globalLogger *zap.Logger = zap.NewNop()
-
-// SetGlobalLogger 设置全局日志器
-func SetGlobalLogger(logger *zap.Logger) {
-	if logger != nil {
-		globalLogger = logger
+func (c *stackTrimCore) With(fields []zapcore.Field) zapcore.Core {
+	return &stackTrimCore{
+		Core:      c.Core.With(fields),
+		maxFrames: c.maxFrames,
 	}
 }
 
-// GetGlobalLogger 获取全局日志器
-func GetGlobalLogger() *zap.Logger {
-	return globalLogger
-}
-
-// 快速日志记录函数
-
-// Debug 使用全局日志器记录调试信息
-func Debug(msg string, fields ...zap.Field) {
-	globalLogger.Debug(msg, fields...)
-}
-
-// Info 使用全局日志器记录一般信息
-func Info(msg string, fields ...zap.Field) {
-	globalLogger.Info(msg, fields...)
-}
-
-// Warn 使用全局日志器记录警告信息
-func Warn(msg string, fields ...zap.Field) {
-	globalLogger.Warn(msg, fields...)
-}
-
-// Error 使用全局日志器记录错误信息
-func Error(msg string, fields ...zap.Field) {
-	globalLogger.Error(msg, fields...)
-}
-
-// DPanic 使用全局日志器记录严重错误
-func DPanic(msg string, fields ...zap.Field) {
-	globalLogger.DPanic(msg, fields...)
-}
-
-// Panic 使用全局日志器记录并触发panic
-func Panic(msg string, fields ...zap.Field) {
-	globalLogger.Panic(msg, fields...)
-}
-
-// Fatal 使用全局日志器记录致命错误并退出
-func Fatal(msg string, fields ...zap.Field) {
-	globalLogger.Fatal(msg, fields...)
-}
-
-// WithError 快速创建带错误字段的日志
-func WithError(logger *zap.Logger, err error) *zap.Logger {
-	if err == nil {
-		return logger
+func (c *stackTrimCore) Check(ent zapcore.Entry, ce *zapcore.CheckedEntry) *zapcore.CheckedEntry {
+	if c.Enabled(ent.Level) {
+		return ce.AddCore(ent, c)
 	}
-	return logger.With(zap.Error(err))
+	return ce
 }
 
-// Sync 同步所有日志缓冲区到输出
-func Sync() error {
-	return globalLogger.Sync()
+func (c *stackTrimCore) Write(ent zapcore.Entry, fields []zapcore.Field) error {
+	// 复制 Entry 避免修改原始数据
+	newEnt := ent
+	if newEnt.Stack != "" {
+		lines := strings.Split(newEnt.Stack, "\n")
+		maxLines := c.maxFrames * 2 // 每个帧包含函数名和文件位置两行
+		if len(lines) > maxLines {
+			newEnt.Stack = strings.Join(lines[:maxLines], "\n") + "\n\t... stack trimmed ..."
+		}
+	}
+	return c.Core.Write(newEnt, fields)
+}
+
+// Sugar 返回 SugaredLogger
+func (l *Logger) Sugar() *zap.SugaredLogger {
+	return l.sugar
+}
+
+// Sync 刷新缓冲区
+func (l *Logger) Sync() error {
+	if err := l.Logger.Sync(); err != nil {
+		// 忽略 stdout/stderr 的 sync 错误
+		if !strings.Contains(err.Error(), "inappropriate ioctl for device") {
+			return err
+		}
+	}
+	return nil
+}
+
+// Close 关闭日志
+func (l *Logger) Close() error {
+	// 先刷新缓冲区
+	if err := l.Sync(); err != nil {
+		return err
+	}
+
+	// 关闭 rotatelogs
+	if l.rotateLog != nil {
+		return l.rotateLog.Close()
+	}
+
+	return nil
+}
+
+// GetConfig 获取配置
+func (l *Logger) GetConfig() *Config {
+	cfg := *l.config
+	return &cfg
 }

@@ -1,139 +1,184 @@
-// Package lifecycle 提供应用程序生命周期管理，支持优雅启动和关闭。
 package lifecycle
 
 import (
 	"context"
-	"fmt"
+	"log"
 	"os"
 	"os/signal"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 )
 
-// Options 配置选项
-type Options struct {
-	ShutdownTimeout time.Duration
+/**********************************************************************
+* 公共 API
+**********************************************************************/
+
+// AppContext 返回“运行期” ctx；第一次收到信号或手动 BeginShutdown 时会被取消。
+func AppContext() context.Context { return def.appCtx }
+
+// ShutdownContext 返回“停机期” ctx；
+// 未进入停机流程前等同于 context.Background()。
+func ShutdownContext() context.Context { return def.shutdownCtx() }
+
+// Register 在优雅停机阶段要执行的清理回调。
+// 回调会在单独 goroutine 中执行；ctx == ShutdownContext()。
+func Register(fn func(context.Context) error) { def.register(fn) }
+
+// SetTimeout 修改优雅停机超时时间（默认 15s）；只能在 Running 状态下调用。
+func SetTimeout(d time.Duration) { def.setTimeout(d) }
+
+// BeginShutdown 手动触发优雅停机（通常不需要调用，信号监听会自动触发）。
+func BeginShutdown() { def.beginShutdown() }
+
+// Wait 阻塞直到停机流程“完成”(所有 Hook 跑完或超时)。
+func Wait() { <-def.done }
+
+// IsRunning / IsShuttingDown / IsStopped = 当前状态观察
+func IsRunning() bool      { return atomic.LoadInt32(&def.state) == stateRunning }
+func IsShuttingDown() bool { return atomic.LoadInt32(&def.state) == stateShutting }
+func IsStopped() bool      { return atomic.LoadInt32(&def.state) == stateStopped }
+
+/**********************************************************************
+* 默认单例 manager
+**********************************************************************/
+
+var def = newManager(defaultTimeout)
+
+const (
+	defaultTimeout = 15 * time.Second
+
+	stateRunning int32 = iota
+	stateShutting
+	stateStopped
+)
+
+type manager struct {
+	// ---- 生命周期 ctx ----
+	appCtx    context.Context // 运行期 ctx（被信号/手动关闭时 cancel）
+	appCancel context.CancelFunc
+	sdCtx     context.Context
+	sdCancel  context.CancelFunc
+
+	// ---- 钩子 ----
+	mu    sync.Mutex
+	hooks []func(context.Context) error
+	wg    sync.WaitGroup
+
+	// ---- 其它 ----
+	state   int32         // atomic
+	timeout time.Duration // 优雅停机超时
+	done    chan struct{} // 彻底完成时关闭
+	once    sync.Once     // 保证 BeginShutdown 只执行一次
 }
 
-// DefaultOptions 返回默认配置
-func DefaultOptions() Options {
-	return Options{
-		ShutdownTimeout: 30 * time.Second, // 默认30秒超时
+func newManager(timeout time.Duration) *manager {
+	m := &manager{
+		timeout: timeout,
+		state:   stateRunning,
+		done:    make(chan struct{}),
 	}
-}
 
-// Lifecycle 生命周期管理器
-type Lifecycle struct {
-	ctx          context.Context
-	cancel       context.CancelFunc
-	wg           sync.WaitGroup
-	done         chan struct{}
-	opts         Options
-	cleanupHooks []func()
-	shutdownOnce sync.Once
-}
+	m.appCtx, m.appCancel = context.WithCancel(context.Background())
 
-// New 创建新的生命周期管理器
-func New(opts Options) *Lifecycle {
-	ctx, cancel := context.WithCancel(context.Background())
+	// 信号监听
+	sigCh := make(chan os.Signal, 2)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 
-	lc := &Lifecycle{
-		ctx:          ctx,
-		cancel:       cancel,
-		done:         make(chan struct{}),
-		opts:         opts,
-		cleanupHooks: []func(){},
-	}
-
-	// 监听系统信号
-	go lc.listenForSignals()
-
-	return lc
-}
-
-// Context 返回生命周期的上下文
-func (l *Lifecycle) Context() context.Context {
-	return l.ctx
-}
-
-// AddCleanupHook 添加清理钩子
-func (l *Lifecycle) AddCleanupHook(hook func()) {
-	l.cleanupHooks = append(l.cleanupHooks, hook)
-}
-
-// listenForSignals 监听系统信号
-func (l *Lifecycle) listenForSignals() {
-	sigs := make(chan os.Signal, 1)
-	signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)
-
-	select {
-	case sig := <-sigs:
-		fmt.Printf("Received signal: %v\n", sig)
-		l.Shutdown()
-	case <-l.ctx.Done():
-		// 上下文已取消，无需额外操作
-	}
-}
-
-// executeCleanupHooks 执行所有清理钩子
-func (l *Lifecycle) executeCleanupHooks() {
-	for _, hook := range l.cleanupHooks {
-		hook()
-	}
-}
-
-// Go 启动一个受管理的goroutine
-func (l *Lifecycle) Go(f func(ctx context.Context) error) <-chan error {
-	errChan := make(chan error, 1)
-
-	l.wg.Add(1)
 	go func() {
-		defer l.wg.Done()
-		defer close(errChan)
-		defer func() {
-			if r := recover(); r != nil {
-				errChan <- fmt.Errorf("panic occurred: %v", r)
+		for {
+			sig := <-sigCh
+			if atomic.LoadInt32(&m.state) == stateRunning {
+				log.Printf("[lifecycle] receive %s, begin graceful shutdown", sig)
+				m.beginShutdown()
+			} else {
+				log.Printf("[lifecycle] receive %s again, force exit", sig)
+				os.Exit(1)
 			}
-		}()
-
-		if err := f(l.ctx); err != nil {
-			errChan <- err
 		}
 	}()
-
-	return errChan
+	return m
 }
 
-// Wait 等待生命周期结束
-func (l *Lifecycle) Wait() {
-	<-l.done
+/**********************************************************************
+* manager 逻辑
+**********************************************************************/
+
+func (m *manager) shutdownCtx() context.Context {
+	// 尚未进入停机态时返回背景 ctx，以保证永不为 nil
+	if atomic.LoadInt32(&m.state) == stateRunning {
+		return context.Background()
+	}
+	return m.sdCtx
 }
 
-// Shutdown 触发优雅关闭流程
-func (l *Lifecycle) Shutdown() {
-	l.shutdownOnce.Do(func() {
-		// 取消上下文
-		l.cancel()
+func (m *manager) setTimeout(d time.Duration) {
+	if atomic.LoadInt32(&m.state) != stateRunning {
+		return // 只允许在正常运行时改
+	}
+	m.timeout = d
+}
 
-		// 等待所有goroutine完成或超时
-		waitCh := make(chan struct{})
-		go func() {
-			l.wg.Wait()
-			close(waitCh)
-		}()
+func (m *manager) register(fn func(context.Context) error) {
+	if fn == nil {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	// 若已进入停机流程，直接异步执行到当前 ctx 中
+	if atomic.LoadInt32(&m.state) != stateRunning {
+		go fn(m.shutdownCtx())
+		return
+	}
+	m.hooks = append(m.hooks, fn)
+}
 
-		select {
-		case <-waitCh:
-			// 所有goroutine已完成
-		case <-time.After(l.opts.ShutdownTimeout):
-			// 超时
+func (m *manager) beginShutdown() {
+	// 只执行一次
+	m.once.Do(func() {
+		if !atomic.CompareAndSwapInt32(&m.state, stateRunning, stateShutting) {
+			return
 		}
 
-		// 执行清理钩子
-		l.executeCleanupHooks()
+		m.appCancel()
 
-		// 标记完成
-		close(l.done)
+		m.sdCtx, m.sdCancel = context.WithTimeout(context.Background(), m.timeout)
+
+		go m.runHooks()
+
+		go func() {
+			<-m.sdCtx.Done()
+			m.complete()
+		}()
 	})
+}
+
+func (m *manager) runHooks() {
+	m.mu.Lock()
+	hooks := make([]func(context.Context) error, len(m.hooks))
+	copy(hooks, m.hooks)
+	m.mu.Unlock()
+
+	for _, h := range hooks {
+		m.wg.Add(1)
+		go func(fn func(context.Context) error) {
+			defer m.wg.Done()
+			_ = fn(m.sdCtx)
+		}(h)
+	}
+
+	// 等待全部 hook 结束
+	m.wg.Wait()
+	m.complete()
+}
+
+func (m *manager) complete() {
+	if !atomic.CompareAndSwapInt32(&m.state, stateShutting, stateStopped) {
+		return
+	}
+	if m.sdCancel != nil {
+		m.sdCancel()
+	}
+	close(m.done)
 }
